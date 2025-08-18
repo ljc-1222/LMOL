@@ -6,7 +6,7 @@ import random
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
 
-from config import config
+from configs.config import config
 
 @dataclass
 class PairRecord:

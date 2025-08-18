@@ -12,6 +12,12 @@ class Config:
     IMAGE_SIZE: int = 336  # CLIP ViT-L/14-336px
 
     # ----------------------------
+    # Dataset paths (produced by dataset_generator.py)
+    # ----------------------------
+    TRAIN_PAIRS_CSV: str = "./pairs/train_fold1_90000.csv"
+    EVAL_PAIRS_CSV:  str = "./pairs/eval_fold1_3000.csv"
+
+    # ----------------------------
     # Instruction & Answers (strictly match paper)
     # ----------------------------
     QUESTION_TEXT: str = "which face looks more attractive?"

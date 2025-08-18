@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset
 from PIL import Image
 
-from configs import config
+from configs.config import config
 from data.data_utils import PairRecord, read_pairs_csv
 from utils.transform import basic_image_loader
 
