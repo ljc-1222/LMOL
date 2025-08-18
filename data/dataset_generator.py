@@ -3,19 +3,18 @@
 """
 dataset_generator.py
 
-This script generates offline, class-balanced pairwise datasets for LMOL/UOL-style
-order learning from a plain labels file. No argument parser is used; all settings
-are defined as constants below.
+Generate offline, class-balanced pairwise datasets for LMOL/UOL-style order learning
+using ONLY settings defined in config.py (no argparse or hard-coded constants).
 
 Strict alignment with UOL/LMOL and your project's IO format:
 - Threshold theta=0.2 to define "Similar." (≈).
 - Exactly three label strings: "First.", "Second.", "Similar."
 - CSV schema exactly: img1,img2,score1,score2,label
-- Output files per fold (K-fold on images):
-    ./pairs/train_fold{fold}_{N}.csv  (N = 3 * TRAIN_PER_CLASS)
-    ./pairs/eval_fold{fold}_{M}.csv   (M = 3 * EVAL_PER_CLASS)
-- Train pairs are sampled only from train images of the fold, eval pairs only from
-  eval images of the fold (no leakage).
+- Output files per fold (K-fold on images) in config.PAIRS_OUT_DIR:
+    train_fold{fold}_{N}.csv  (N = 3 * TRAIN_PER_CLASS)
+    eval_fold{fold}_{M}.csv   (M = 3 * EVAL_PER_CLASS)
+- Train pairs are sampled only from train images of the fold; eval pairs only from
+  eval images (no leakage).
 """
 
 import csv
@@ -23,27 +22,7 @@ import os
 import random
 from typing import Dict, List, Tuple
 
-# ----------------------------
-# Hard-coded settings
-# ----------------------------
-LABELS_PATH = "./labels.txt"     # a text file with lines "<filename> <score>"
-IMAGE_DIR   = "./images"         # prefix to prepend to filenames in CSV; "" means filenames only
-OUT_DIR     = "./pairs"          # where CSVs will be written
-
-KFOLDS = 5                       # number of folds
-SEED   = 42                      # global seed for shuffling and sampling
-
-# Per-class pair counts (total = 3 * per_class)
-TRAIN_PER_CLASS = 30_000         # 30k per class -> 90k total per fold (LMOL)
-EVAL_PER_CLASS  = 1_000          # 1k per class  -> 3k total per fold
-
-# Tri-class threshold as in UOL/LMOL: |s1 - s2| <= THETA => "Similar."
-THETA = 0.2
-
-# Label literals (must be exact)
-ANSWER_FIRST   = "First."
-ANSWER_SECOND  = "Second."
-ANSWER_SIMILAR = "Similar."
+from configs.config import config  # use all settings from config.py
 
 CSV_FIELDS = ["img1", "img2", "score1", "score2", "label"]
 
@@ -52,7 +31,7 @@ CSV_FIELDS = ["img1", "img2", "score1", "score2", "label"]
 # I/O helpers
 # ----------------------------
 def read_labels_file(labels_path: str) -> Dict[str, float]:
-    """Read 'labels.txt' where each non-empty line is '<filename> <score>'."""
+    """Read labels file where each non-empty line is '<filename> <score>'."""
     scores: Dict[str, float] = {}
     with open(labels_path, "r", encoding="utf-8") as f:
         for raw in f:
@@ -100,8 +79,8 @@ def label_from_scores(s1: float, s2: float, theta: float) -> str:
     """Return one of 'First.' | 'Second.' | 'Similar.' using the LMOL/UOL rule."""
     diff = s1 - s2
     if abs(diff) <= theta:
-        return ANSWER_SIMILAR
-    return ANSWER_FIRST if diff > 0 else ANSWER_SECOND
+        return config.ANSWER_SIMILAR
+    return config.ANSWER_FIRST if diff > 0 else config.ANSWER_SECOND
 
 
 def build_offline_balanced_pairs(
@@ -122,17 +101,17 @@ def build_offline_balanced_pairs(
         raise ValueError("Need at least two images to build pairs.")
 
     buckets: Dict[str, List[Tuple[str, str, float, float, str]]] = {
-        ANSWER_FIRST: [],
-        ANSWER_SECOND: [],
-        ANSWER_SIMILAR: [],
+        config.ANSWER_FIRST: [],
+        config.ANSWER_SECOND: [],
+        config.ANSWER_SIMILAR: [],
     }
 
     TRIAL_CAP = 10_000_000
     trials = 0
 
-    while (len(buckets[ANSWER_FIRST])  < per_class or
-           len(buckets[ANSWER_SECOND]) < per_class or
-           len(buckets[ANSWER_SIMILAR])< per_class) and trials < TRIAL_CAP:
+    while (len(buckets[config.ANSWER_FIRST])   < per_class or
+           len(buckets[config.ANSWER_SECOND])  < per_class or
+           len(buckets[config.ANSWER_SIMILAR]) < per_class) and trials < TRIAL_CAP:
 
         i, j = rng.randrange(n), rng.randrange(n)
         if i == j:
@@ -152,14 +131,16 @@ def build_offline_balanced_pairs(
     if any(len(buckets[k]) < per_class for k in buckets):
         raise RuntimeError(
             "Failed to construct balanced pairs. "
-            f"Got counts: First={len(buckets[ANSWER_FIRST])}, "
-            f"Second={len(buckets[ANSWER_SECOND])}, "
-            f"Similar={len(buckets[ANSWER_SIMILAR])}. "
+            f"Got counts: First={len(buckets[config.ANSWER_FIRST])}, "
+            f"Second={len(buckets[config.ANSWER_SECOND])}, "
+            f"Similar={len(buckets[config.ANSWER_SIMILAR])}. "
             "Consider reducing per_class or verifying score distribution."
         )
 
     # Fixed concatenation order for reproducibility
-    rows = buckets[ANSWER_FIRST] + buckets[ANSWER_SECOND] + buckets[ANSWER_SIMILAR]
+    rows = (buckets[config.ANSWER_FIRST] +
+            buckets[config.ANSWER_SECOND] +
+            buckets[config.ANSWER_SIMILAR])
     return rows
 
 
@@ -191,54 +172,54 @@ def prepend_dir(rows: List[Tuple[str, str, float, float, str]], image_dir: str) 
 # ----------------------------
 def main() -> None:
     # Seeds
-    random.seed(SEED)
+    random.seed(config.SEED)
 
     # Read labels
-    scores = read_labels_file(LABELS_PATH)
+    scores = read_labels_file(config.LABELS_PATH)
     img_names = sorted(scores.keys())
 
     # Prepare out dir
-    ensure_dir(OUT_DIR)
+    ensure_dir(config.PAIRS_OUT_DIR)
 
     # Build folds
-    base_rng = random.Random(SEED)
-    folds = kfold_split_images(img_names, KFOLDS, base_rng)
+    base_rng = random.Random(config.SEED)
+    folds = kfold_split_images(img_names, config.KFOLDS, base_rng)
 
     # For each fold, build train/eval rows and write to CSV
-    for f_idx in range(KFOLDS):
+    for f_idx in range(config.KFOLDS):
         fold_id = f_idx + 1
 
         eval_imgs  = folds[f_idx]
         train_imgs = [x for i, fold in enumerate(folds) if i != f_idx for x in fold]
 
         # Use different RNGs per fold/split for reproducibility
-        rng_train = random.Random(SEED + 100 * fold_id)
-        rng_eval  = random.Random(SEED + 100 * fold_id + 1)
+        rng_train = random.Random(config.SEED + 100 * fold_id)
+        rng_eval  = random.Random(config.SEED + 100 * fold_id + 1)
 
         train_rows = build_offline_balanced_pairs(
             images=train_imgs,
             scores=scores,
-            per_class=TRAIN_PER_CLASS,
-            theta=THETA,
+            per_class=config.TRAIN_PER_CLASS,
+            theta=config.THETA,
             rng=rng_train,
         )
         eval_rows = build_offline_balanced_pairs(
             images=eval_imgs,
             scores=scores,
-            per_class=EVAL_PER_CLASS,
-            theta=THETA,
+            per_class=config.EVAL_PER_CLASS,
+            theta=config.THETA,
             rng=rng_eval,
         )
 
-        # Prepend IMAGE_DIR so CSV stores absolute/relative paths expected by your loader
-        train_rows = prepend_dir(train_rows, IMAGE_DIR)
-        eval_rows  = prepend_dir(eval_rows,  IMAGE_DIR)
+        # Prepend IMAGE_DIR so CSV stores paths expected by your loader
+        train_rows = prepend_dir(train_rows, config.IMAGE_DIR)
+        eval_rows  = prepend_dir(eval_rows,  config.IMAGE_DIR)
 
         # Filenames as required by your project
-        train_total = 3 * TRAIN_PER_CLASS
-        eval_total  = 3 * EVAL_PER_CLASS
-        train_csv = os.path.join(OUT_DIR, f"train_fold{fold_id}_{train_total}.csv")
-        eval_csv  = os.path.join(OUT_DIR, f"eval_fold{fold_id}_{eval_total}.csv")
+        train_total = 3 * config.TRAIN_PER_CLASS
+        eval_total  = 3 * config.EVAL_PER_CLASS
+        train_csv = os.path.join(config.PAIRS_OUT_DIR, f"train_fold{fold_id}_{train_total}.csv")
+        eval_csv  = os.path.join(config.PAIRS_OUT_DIR,  f"eval_fold{fold_id}_{eval_total}.csv")
 
         write_pairs_csv(train_csv, train_rows)
         write_pairs_csv(eval_csv,  eval_rows)
