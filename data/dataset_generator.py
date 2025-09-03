@@ -12,9 +12,10 @@ Strict alignment with UOL/LMOL and your project's IO format:
 - CSV schema exactly: img1,img2,score1,score2,label
 - Output files per fold (K-fold on images) in config.PAIRS_OUT_DIR:
     train_fold{fold}_{N}.csv  (N = 3 * TRAIN_PER_CLASS)
-    eval_fold{fold}_{M}.csv   (M = 3 * EVAL_PER_CLASS)
+    eval_fold{fold}_{M}.csv   (M = C(n_eval, 2), i.e., all unordered pairs from that fold's eval images)
 - Train pairs are sampled only from train images of the fold; eval pairs only from
   eval images (no leakage).
+- NEW: Eval set is now all unordered pairs (i < j) for the fold's eval images.
 """
 
 import csv
@@ -59,6 +60,7 @@ def ensure_dir(path: str) -> None:
 
 def write_pairs_csv(path: str, rows: List[Tuple[str, str, float, float, str]]) -> None:
     """Write rows to CSV with exact schema required by your project."""
+    ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
@@ -168,6 +170,64 @@ def prepend_dir(rows: List[Tuple[str, str, float, float, str]], image_dir: str) 
 
 
 # ----------------------------
+# Eval: all-pairs helpers (NEW)
+# ----------------------------
+def n_choose_2(n: int) -> int:
+    """Return the number of unordered pairs from n distinct items."""
+    if n < 2:
+        return 0
+    return n * (n - 1) // 2
+
+
+def write_eval_all_pairs_csv(
+    path: str,
+    images: List[str],
+    scores: Dict[str, float],
+    theta: float,
+    image_dir: str,
+) -> None:
+    """
+    Stream-write ALL unordered pairs (i < j) of `images` to CSV.
+    This avoids holding ~600k rows in memory for each fold.
+    """
+    ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+
+        # Local bindings for speed
+        ans_first = config.ANSWER_FIRST
+        ans_second = config.ANSWER_SECOND
+        ans_sim = config.ANSWER_SIMILAR
+        th = theta
+        join = os.path.join
+
+        n = len(images)
+        for i in range(n):
+            f1 = images[i]
+            s1 = scores[f1]
+            p1 = join(image_dir, f1) if image_dir else f1
+            for j in range(i + 1, n):
+                f2 = images[j]
+                s2 = scores[f2]
+                p2 = join(image_dir, f2) if image_dir else f2
+
+                diff = s1 - s2
+                if abs(diff) <= th:
+                    lab = ans_sim
+                else:
+                    lab = ans_first if diff > 0 else ans_second
+
+                writer.writerow({
+                    "img1": p1,
+                    "img2": p2,
+                    "score1": f"{s1:.6f}",
+                    "score2": f"{s2:.6f}",
+                    "label": lab
+                })
+
+
+# ----------------------------
 # Main (no argparse)
 # ----------------------------
 def main() -> None:
@@ -189,13 +249,13 @@ def main() -> None:
     for f_idx in range(config.KFOLDS):
         fold_id = f_idx + 1
 
-        eval_imgs  = folds[f_idx]
+        eval_imgs  = folds[f_idx]  # per-fold eval set (e.g., 1100 images if total is 5500 with 5 folds)
         train_imgs = [x for i, fold in enumerate(folds) if i != f_idx for x in fold]
 
-        # Use different RNGs per fold/split for reproducibility
+        # RNG for train sampling (eval is deterministic all-pairs)
         rng_train = random.Random(config.SEED + 100 * fold_id)
-        rng_eval  = random.Random(config.SEED + 100 * fold_id + 1)
 
+        # TRAIN: class-balanced sampling (unchanged)
         train_rows = build_offline_balanced_pairs(
             images=train_imgs,
             scores=scores,
@@ -203,26 +263,26 @@ def main() -> None:
             theta=config.THETA,
             rng=rng_train,
         )
-        eval_rows = build_offline_balanced_pairs(
-            images=eval_imgs,
-            scores=scores,
-            per_class=config.EVAL_PER_CLASS,
-            theta=config.THETA,
-            rng=rng_eval,
-        )
-
-        # Prepend IMAGE_DIR so CSV stores paths expected by your loader
         train_rows = prepend_dir(train_rows, config.IMAGE_DIR)
-        eval_rows  = prepend_dir(eval_rows,  config.IMAGE_DIR)
 
-        # Filenames as required by your project
+        # EVAL: all unordered pairs from eval images (NEW)
+        eval_total  = n_choose_2(len(eval_imgs))  # e.g., C(1100, 2) = 604450
         train_total = 3 * config.TRAIN_PER_CLASS
-        eval_total  = 3 * config.EVAL_PER_CLASS
+
         train_csv = os.path.join(config.PAIRS_OUT_DIR, f"train_fold{fold_id}_{train_total}.csv")
         eval_csv  = os.path.join(config.PAIRS_OUT_DIR,  f"eval_fold{fold_id}_{eval_total}.csv")
 
+        # Write train (unchanged)
         write_pairs_csv(train_csv, train_rows)
-        write_pairs_csv(eval_csv,  eval_rows)
+
+        # Stream-write eval all-pairs (NEW)
+        write_eval_all_pairs_csv(
+            path=eval_csv,
+            images=eval_imgs,
+            scores=scores,
+            theta=config.THETA,
+            image_dir=config.IMAGE_DIR,
+        )
 
         print(f"[Fold {fold_id}] Wrote: {train_csv} and {eval_csv}")
 

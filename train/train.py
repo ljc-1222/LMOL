@@ -3,11 +3,12 @@
 import os
 import json
 import math
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
 
-# Fix tokenizer parallelism warning before importing torch/transformers
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
@@ -25,8 +26,8 @@ from data.dataset import SCUT_FBP5500_Pairs
 from utils.data_collator import LlavaPairsCollator
 from model.model import model_generator
 
-# Project root when running "python3 -m train.train" from LMOL/
-PROJECT_ROOT = Path(__file__).resolve().parents[1]  # -> LMOL/
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def resolve_path(p: str) -> Path:
@@ -58,6 +59,7 @@ def group_parameters_for_optimizer(model) -> List[Dict[str, Any]]:
         elif "mm_projector" in n or "multi_modal_projector" in n:
             proj_params.append(p)
         else:
+            # Any unexpected trainable param should not appear
             pass
 
     param_groups: List[Dict[str, Any]] = []
@@ -115,7 +117,6 @@ class SaveBestTrainingLossCallback(TrainerCallback):
 
             # Save model & processors to save_dir
             if model is not None:
-                # Note: we do not rely on trainer's built-in save_strategy; we save here.
                 model.save_pretrained(self.save_dir, safe_serialization=False)
                 try:
                     self._processor.save_pretrained(self.save_dir)
@@ -133,6 +134,13 @@ class SaveBestTrainingLossCallback(TrainerCallback):
             self._write_meta(loss, state)
 
 
+def _count_parameters(model) -> tuple[int, int]:
+    """Return (total_params, trainable_params)."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
 def train_one_fold(fold_idx: int, train_csv_path: Path, fold_dir: Path) -> None:
     """Train the model for a single fold on the given CSV dataset path."""
     # Reproducibility
@@ -146,6 +154,11 @@ def train_one_fold(fold_idx: int, train_csv_path: Path, fold_dir: Path) -> None:
 
     # Model / Processor / Tokenizer
     model, processor, tokenizer = model_generator()
+
+    # Print parameter stats before training
+    total_params, trainable_params = _count_parameters(model)
+    print(f"[Model Size] total_params={total_params:,} | trainable_params={trainable_params:,} | "
+          f"trainable_ratio={trainable_params/total_params:.6f}")
 
     # Collator
     collator = LlavaPairsCollator(
@@ -168,24 +181,24 @@ def train_one_fold(fold_idx: int, train_csv_path: Path, fold_dir: Path) -> None:
     print(f" - Saving best to: {fold_dir}")
     print("=" * 80)
 
-    # Training arguments (note: use eval_strategy per your request)
+    # Training arguments (LMOL uses eval=no; save by callback)
     args = TrainingArguments(
-        output_dir=str(fold_dir),           
+        output_dir=str(fold_dir),
         overwrite_output_dir=True,
         num_train_epochs=config.NUM_EPOCHS,
         per_device_train_batch_size=config.PER_DEVICE_TRAIN_BATCH_SIZE,
         gradient_accumulation_steps=config.GRADIENT_ACCUMULATION_STEPS,
-        learning_rate=config.LR_LORA,       
+        learning_rate=config.LR_LORA,   # base LR; param groups override
         weight_decay=config.WEIGHT_DECAY,
         logging_steps=config.LOGGING_STEPS,
         logging_strategy="steps",
-        eval_strategy="no",                   
-        save_strategy="no",                  
+        eval_strategy="no",
+        save_strategy="no",
         dataloader_num_workers=config.DATALOADER_NUM_WORKERS,
         fp16=False,
         bf16=True,
         optim="adamw_torch",
-        report_to=[],                       
+        report_to=[],
         disable_tqdm=False,
     )
 
@@ -218,18 +231,14 @@ def train_one_fold(fold_idx: int, train_csv_path: Path, fold_dir: Path) -> None:
 
 
 def main():
-    # -----------------------------
     # Build the base RUN_DIR once
-    # -----------------------------
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = getattr(config, "MODEL_SAVE_DIR", None)
-    if base_dir is None:
-        base_dir = config.OUTPUT_DIR  # fall back to OUTPUT_DIR if MODEL_SAVE_DIR is missing
+    base_dir = getattr(config, "MODEL_SAVE_DIR", None) or config.OUTPUT_DIR
     RUN_DIR = resolve_path(base_dir) / run_stamp
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[RunDir] checkpoints will be saved under: {RUN_DIR.resolve()}")
 
-    # Resolve five training CSV paths and ensure they exist
+    # Resolve training CSV paths and ensure they exist
     train_csvs = [ensure_exists(resolve_path(p)) for p in config.TRAIN_PAIRS_CSVS]
 
     # 5-fold training loop — each fold saves to RUN_DIR/fold{n}
@@ -237,8 +246,6 @@ def main():
         fold_dir = RUN_DIR / f"fold{fold_idx}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         train_one_fold(fold_idx, train_csv, fold_dir)
-
-        # Optional: free GPU cache between folds
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

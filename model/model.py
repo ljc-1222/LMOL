@@ -2,13 +2,16 @@
 
 from typing import Optional
 import torch
-from transformers import AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
+from transformers import AutoProcessor, AutoImageProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import bitsandbytes as bnb
 
 from configs.config import config
 
 
+# ----------------------------
+# Projector utilities
+# ----------------------------
 def _get_projector(model):
     if hasattr(model, "multi_modal_projector") and model.multi_modal_projector is not None:
         return "multi_modal_projector", model.multi_modal_projector
@@ -95,6 +98,8 @@ def _replace_projector_linear4bit(projector: torch.nn.Module, vision_dim: int, h
                 w_full = layer.weight.dequantize()
             else:
                 w_full = layer.weight.float()
+
+            # Attempt to reshape/transposed-reshape; probe if packed
             if w_full.numel() == out_f * in_f:
                 if w_full.dim() == 2 and w_full.shape == (out_f, in_f):
                     weight_matrix = w_full
@@ -103,7 +108,7 @@ def _replace_projector_linear4bit(projector: torch.nn.Module, vision_dim: int, h
                 else:
                     weight_matrix = w_full.view(out_f, in_f)
             elif w_full.numel() * 2 == out_f * in_f:
-                print(f"[ProjectorReplace] Reconstructing {name} via probing due to packed size {w_full.numel()}")
+                # Probe by feeding identity
                 eye = torch.eye(in_f, device=w_full.device, dtype=dtype)
                 outputs = []
                 batch = 512 if in_f > 512 else in_f
@@ -117,9 +122,13 @@ def _replace_projector_linear4bit(projector: torch.nn.Module, vision_dim: int, h
                     layer.train()
                 weight_matrix = torch.cat(outputs, dim=0).transpose(0, 1).contiguous().to(torch.float32)
             else:
-                raise ValueError(f"Unexpected weight size for {name}: {w_full.shape}, numel={w_full.numel()}, expected {out_f*in_f}")
+                raise ValueError(
+                    f"Unexpected weight size for {name}: {w_full.shape}, numel={w_full.numel()}, expected {out_f*in_f}"
+                )
+
             if weight_matrix.shape != (out_f, in_f):
                 raise ValueError(f"Final shape mismatch for {name}: {weight_matrix.shape} vs ({out_f},{in_f})")
+
             new_lin = torch.nn.Linear(in_f, out_f, bias=(layer.bias is not None), dtype=dtype, device=weight_matrix.device)
             new_lin.weight.copy_(weight_matrix.to(dtype))
             if layer.bias is not None:
@@ -130,7 +139,29 @@ def _replace_projector_linear4bit(projector: torch.nn.Module, vision_dim: int, h
         setattr(projector, name, new_lin)
 
 
+# ----------------------------
+# Freeze/Train helpers
+# ----------------------------
+def _freeze_all(module: torch.nn.Module) -> None:
+    for p in module.parameters():
+        p.requires_grad = False
+
+def _mark_lora_trainable(module: torch.nn.Module) -> None:
+    # PEFT injects LoRA params, typically named with "lora_"
+    for n, p in module.named_parameters():
+        if "lora_" in n or "lora_A" in n or "lora_B" in n:
+            p.requires_grad = True
+
+def _mark_projector_trainable(projector: torch.nn.Module) -> None:
+    for p in projector.parameters():
+        p.requires_grad = True
+
+
+# ----------------------------
+# Public API
+# ----------------------------
 def model_generator():
+    # 4-bit loading config (QLoRA)
     bnb_config = None
     if config.USE_4BIT:
         compute_dtype = torch.bfloat16 if config.BNB_4BIT_COMPUTE_DTYPE == "bfloat16" else torch.float16
@@ -141,6 +172,7 @@ def model_generator():
             bnb_4bit_quant_type=config.BNB_4BIT_QUANT_TYPE,
         )
 
+    # Load LLaVA
     model = LlavaForConditionalGeneration.from_pretrained(
         config.MODEL_ID,
         torch_dtype=torch.bfloat16,
@@ -148,19 +180,33 @@ def model_generator():
         quantization_config=bnb_config,
         device_map="auto",
     )
-    processor = AutoProcessor.from_pretrained(config.MODEL_ID)
+    # IMPORTANT: disable cache to avoid checkpointing warning
+    model.config.use_cache = False
 
+    # Enable gradient checkpointing with explicit use_reentrant flag
     model.gradient_checkpointing_enable()
 
-    if hasattr(model, "vision_tower") and model.vision_tower is not None:
-        for p in model.vision_tower.parameters():
-            p.requires_grad = False
+    # Processor + Fast image processor
+    processor = AutoProcessor.from_pretrained(config.MODEL_ID)
+    # Try to upgrade to fast image processor to remove "slow image processor" warning
+    try:
+        fast_img_proc = AutoImageProcessor.from_pretrained(config.MODEL_ID, use_fast=True)
+        if hasattr(processor, "image_processor") and processor.image_processor is not None:
+            processor.image_processor = fast_img_proc
+    except Exception:
+        # Fall back silently if fast variant not available
+        pass
 
+    # Freeze vision tower explicitly
+    if hasattr(model, "vision_tower") and model.vision_tower is not None:
+        _freeze_all(model.vision_tower)
+
+    # Prepare for k-bit training (PEFT utility)
     model = prepare_model_for_kbit_training(model)
 
+    # Replace projector 4-bit Linear with fp32 nn.Linear and make it trainable
     proj_name, projector = _get_projector(model)
     if projector is not None:
-        print(f"Found projector: {proj_name}")
         vision_dim = _extract_vision_hidden_size(model)
         hidden_dim = getattr(model.config, "hidden_size", None)
         if not isinstance(hidden_dim, int):
@@ -168,9 +214,8 @@ def model_generator():
         if vision_dim is None or hidden_dim is None:
             raise ValueError(f"Cannot determine vision_dim ({vision_dim}) or hidden_dim ({hidden_dim}) for projector replacement.")
         _replace_projector_linear4bit(projector, vision_dim=vision_dim, hidden_dim=hidden_dim, dtype=torch.bfloat16)
-        for p in projector.parameters():
-            p.requires_grad = True
 
+    # Apply LoRA to attention projections only
     lora_targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
     peft_cfg = LoraConfig(
         r=config.LORA_R,
@@ -183,9 +228,48 @@ def model_generator():
     )
     model = get_peft_model(model, peft_cfg)
 
+    # Ensure tokenizer has pad token
     tok = processor.tokenizer
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
+    # Final freeze policy: everything off, then enable LoRA + projector
+    _freeze_all(model)
+    _mark_lora_trainable(model)
+    if projector is not None:
+        _mark_projector_trainable(projector)
+
     model.train()
     return model, processor, tok
+
+def build_inference_base():
+    """Return a base LLaVA model prepared like training (quantized + projector replacement) but WITHOUT creating new LoRA adapters.
+    Used for evaluation: afterwards load saved PEFT adapter weights via PeftModel.from_pretrained.
+    """
+    bnb_config = None
+    if config.USE_4BIT:
+        compute_dtype = torch.bfloat16 if config.BNB_4BIT_COMPUTE_DTYPE == "bfloat16" else torch.float16
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=config.BNB_DOUBLE_QUANT,
+            bnb_4bit_quant_type=config.BNB_4BIT_QUANT_TYPE,
+        )
+    model = LlavaForConditionalGeneration.from_pretrained(
+        config.MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        quantization_config=bnb_config,
+        device_map="auto",
+    )
+    model.config.use_cache = False
+    # Replace projector 4-bit layers similarly to training path
+    proj_name, projector = _get_projector(model)
+    if projector is not None:
+        vision_dim = _extract_vision_hidden_size(model)
+        hidden_dim = getattr(model.config, "hidden_size", None)
+        if not isinstance(hidden_dim, int):
+            hidden_dim = _infer_hidden_dim(model, projector)
+        if vision_dim is not None and hidden_dim is not None:
+            _replace_projector_linear4bit(projector, vision_dim, hidden_dim, dtype=torch.bfloat16)
+    return model
