@@ -6,33 +6,8 @@ A PyTorch-based project for training and evaluating multimodal models on beauty 
 
 LMOL is a comprehensive framework for training multimodal models to perform beauty comparison tasks. The project uses a custom projector architecture that integrates with pre-trained vision-language models, specifically LLaVA, to learn comparative beauty judgments from image pairs. The system supports 5-fold cross-validation training, comprehensive evaluation metrics, and efficient fine-tuning using LoRA (Low-Rank Adaptation) techniques.
 
-## Architecture (After Refactor)
+## Architecture 
 
-### Before vs After Directory Structure
-
-**Before (Monolithic Structure):**
-```
-LMOL/
-├── train/
-│   ├── train.py (2000+ lines - monolithic)
-│   └── logging_utils.py (unused)
-├── data/
-│   ├── data_utils.py
-│   ├── dataset_generator.py
-│   └── interval_sampler.py
-├── model/
-│   └── model.py (large mixed-purpose file)
-├── utils/
-│   ├── data_collator.py
-│   ├── transform.py
-│   ├── set_seed.py
-│   └── bradley_terry.py
-├── test_acc.py
-├── test_acc_strict.py
-└── test_score.py
-```
-
-**After (Modular Architecture):**
 ```
 LMOL/
 ├── configs/
