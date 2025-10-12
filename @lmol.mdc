@@ -1,0 +1,202 @@
+# LMOL (Large Multimodal Object Learning) Project Rules
+
+## Project Overview
+LMOL is a multimodal learning project focused on facial attractiveness comparison using LLaVA (Large Language and Vision Assistant) models. The project implements a three-class classification system for comparing facial attractiveness between two images.
+
+## Core Components
+
+### 1. Model Architecture (`model/model.py`)
+- **LMOLProjector**: Two-layer projector (1024 → 4096 → 4096) with GELU activation
+- **Base Model**: LLaVA-1.5-7B-HF with 4-bit quantization support
+- **LoRA Integration**: Parameter-efficient fine-tuning on attention projections (q_proj, k_proj, v_proj, o_proj)
+- **Training Strategy**: Only LoRA parameters and projector are trainable; vision encoder and LLM are frozen
+
+### 2. Data Processing (`data/`)
+- **Dataset**: SCUT-FBP5500 facial beauty dataset
+- **Data Format**: CSV files with image pairs and ground truth labels
+- **Labels**: Three-class system - "First.", "Second.", "Similar."
+- **Data Augmentation**: Swap doubling for consistency training (original + swapped pairs)
+
+### 3. Training Pipeline (`train/train.py`)
+- **Custom Trainer**: WeightedSwapConsistencyTrainer with:
+  - Weighted cross-entropy loss (class weights for "Similar." class)
+  - Swap consistency loss using symmetric KL divergence
+  - Different learning rates for LoRA vs projector parameters
+- **Optimization**: AdamW with separate parameter groups
+- **Evaluation**: Cross-fold validation with 5 folds
+
+### 4. Configuration (`configs/config.py`)
+- **Model Settings**: LLaVA-1.5-7B-HF, 336px images, 1250 max sequence length
+- **Training Parameters**: Batch size, learning rates, epochs, warmup ratio
+- **Loss Weights**: WSIM (Similar class weight), CONS_WEIGHT (consistency weight)
+- **Data Paths**: Configurable image directories and CSV file paths
+
+## Key Features
+
+### Multimodal Learning
+- **Vision-Language Integration**: Combines CLIP vision encoder with LLaVA language model
+- **Image Processing**: 336x336 pixel images with patch-based tokenization
+- **Prompt Engineering**: Structured prompts for attractiveness comparison tasks
+
+### Advanced Training Techniques
+- **Swap Consistency**: Ensures model predictions are consistent when image order is swapped
+- **Class Balancing**: Weighted loss to handle imbalanced "Similar" class
+- **Gradient Checkpointing**: Memory-efficient training for large models
+- **4-bit Quantization**: Reduces memory usage while maintaining performance
+
+### Evaluation Framework
+- **Multiple Metrics**: Accuracy, confusion matrices, per-class performance
+- **Cross-fold Validation**: 5-fold evaluation for robust performance assessment
+- **Score-based Evaluation**: Bradley-Terry model for score-based comparisons
+- **Visualization**: Automatic confusion matrix generation
+
+## File Structure Guidelines
+
+### Model Files
+- `model/model.py`: Core model architecture and factory functions
+- `model/checkpoints/`: Training checkpoints and saved models
+
+### Data Files
+- `data/dataset.py`: PyTorch dataset implementation
+- `data/data_utils.py`: Data loading and preprocessing utilities
+- `data/pairs/`: CSV files for train/eval splits
+- `data/images/`: Image data directory
+
+### Training Files
+- `train/train.py`: Main training script with custom trainer
+- `utils/data_collator.py`: Batch collation for multimodal data
+- `utils/bradley_terry.py`: Bradley-Terry model for score estimation
+
+### Configuration Files
+- `configs/config.py`: Centralized configuration management
+- `utils/set_seed.py`: Reproducibility utilities
+
+### Evaluation Files
+- `test_acc.py`: Accuracy evaluation with confusion matrices
+- `test_score.py`: Score-based evaluation using Bradley-Terry model
+
+## Coding Standards
+
+### Python Style
+- **Type Hints**: All functions must have complete type annotations
+- **Docstrings**: Google-style docstrings for all public functions
+- **Error Handling**: Comprehensive exception handling with informative messages
+- **Logging**: Structured logging for training progress and debugging
+
+### Documentation Standards
+- **Single Documentation File**: Use `MODIFICATION_DIARY.md` for ALL project documentation
+- **NO Scattered Files**: Do not create multiple .md files for recording changes
+- **Consolidate Everything**: Merge all documentation into the single diary file
+- **Update Diary**: Add new entries to the existing diary instead of creating new files
+
+### Model Development
+- **Reproducibility**: Fixed seeds and deterministic operations
+- **Memory Management**: Efficient GPU memory usage with proper cleanup
+- **Modularity**: Clear separation of concerns between components
+- **Extensibility**: Easy to modify for different model architectures or tasks
+
+### Data Handling
+- **Robust Loading**: Multiple fallback paths for image resolution
+- **Validation**: Input validation and sanitization
+- **Caching**: Efficient image and pixel value caching for evaluation
+- **Path Resolution**: Flexible path resolution for different environments
+
+## Training Workflow
+
+### 1. Data Preparation
+- Generate train/eval CSV files with image pairs
+- Ensure proper image path resolution
+- Validate label consistency
+
+### 2. Model Training
+- Load base LLaVA model with 4-bit quantization
+- Replace projector with LMOL-specific architecture
+- Apply LoRA to attention layers
+- Train with weighted consistency loss
+
+### 3. Evaluation
+- Load trained models for each fold
+- Evaluate on test pairs with confusion matrix generation
+- Perform score-based evaluation for comprehensive assessment
+
+## Performance Considerations
+
+### Memory Optimization
+- 4-bit quantization for base model
+- Gradient checkpointing during training
+- Efficient image caching during evaluation
+- Proper GPU memory cleanup between folds
+
+### Training Efficiency
+- Mixed precision training (bfloat16)
+- Gradient accumulation for effective larger batch sizes
+- Optimized data loading with multiple workers
+- Early stopping based on training loss
+
+### Evaluation Speed
+- Pre-computed image embeddings where possible
+- Batch processing for multiple samples
+- Cached tokenization for repeated prompts
+- Parallel evaluation across folds
+
+## Extension Points
+
+### Model Architecture
+- Easy to modify projector dimensions
+- Support for different base models
+- Configurable LoRA parameters
+- Custom loss functions
+
+### Data Processing
+- Support for different image sizes
+- Custom data augmentation strategies
+- Alternative dataset formats
+- Multi-language prompt support
+
+### Training Strategies
+- Different optimization algorithms
+- Custom learning rate schedules
+- Alternative consistency loss formulations
+- Multi-task learning capabilities
+
+## Best Practices
+
+### Development
+- Always test with small datasets first
+- Use proper version control for model checkpoints
+- Document configuration changes
+- Monitor training progress with detailed logging
+
+### Evaluation
+- Use multiple evaluation metrics
+- Perform cross-fold validation
+- Generate visualizations for analysis
+- Compare against baseline models
+
+### Deployment
+- Ensure model compatibility across environments
+- Test with different hardware configurations
+- Validate input data formats
+- Provide clear usage documentation
+
+## Common Issues and Solutions
+
+### Memory Issues
+- Reduce batch size or use gradient accumulation
+- Enable 4-bit quantization
+- Use gradient checkpointing
+- Clear GPU cache between operations
+
+### Training Instability
+- Check learning rate settings
+- Verify data preprocessing
+- Monitor loss components separately
+- Use proper weight initialization
+
+### Evaluation Errors
+- Ensure proper model loading
+- Check data path resolution
+- Validate input formats
+- Use consistent tokenization
+
+This rule file serves as a comprehensive guide for understanding, developing, and maintaining the LMOL project. It should be updated as the project evolves and new features are added.
