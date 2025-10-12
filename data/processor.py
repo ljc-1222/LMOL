@@ -41,7 +41,7 @@ class PairRecord:
         img2: Path to the second image
         score1: Attractiveness score for the first image
         score2: Attractiveness score for the second image
-        label: Comparison label ("First.", "Second.", or "Similar.")
+        label: Comparison label ("First", "Second", or "Similar")
     """
     img1: str
     img2: str
@@ -54,9 +54,9 @@ def label_from_scores(s1: float, s2: float, theta: float) -> str:
     Generate tri-class label based on score difference.
     
     This function implements the LMOL labeling strategy:
-    - If |score1 - score2| <= theta: "Similar."
-    - If score1 > score2 + theta: "First."
-    - If score2 > score1 + theta: "Second."
+    - If |score1 - score2| <= theta: "Similar"
+    - If score1 > score2 + theta: "First"
+    - If score2 > score1 + theta: "Second"
     
     Args:
         s1: Attractiveness score for first image
@@ -64,7 +64,7 @@ def label_from_scores(s1: float, s2: float, theta: float) -> str:
         theta: Threshold for determining similarity
         
     Returns:
-        Canonical answer string ("First.", "Second.", or "Similar.")
+        Canonical answer string ("First", "Second", or "Similar")
     """
     d = abs(s1 - s2)
     if d <= theta:

@@ -138,13 +138,13 @@ class Config:
     # ============================================================================
     
     # Batch processing (2 pairs → 4 samples → 16 steps → 64 samples)
-    PER_DEVICE_TRAIN_BATCH_SIZE: int = 2
+    PER_DEVICE_TRAIN_BATCH_SIZE: int = 16
     """Process 2 pairs at a time (generates 4 samples with swap doubling)"""
     
-    GRADIENT_ACCUMULATION_STEPS: int = 16
+    GRADIENT_ACCUMULATION_STEPS: int = 2
     """Accumulate gradients over 16 steps before parameter update"""
     
-    DATALOADER_NUM_WORKERS: int = 24
+    DATALOADER_NUM_WORKERS: int = 48
     """Number of DataLoader worker processes for parallel data loading"""
     
     DATALOADER_PIN_MEMORY: bool = True
@@ -172,7 +172,7 @@ class Config:
     LOGGING_STEPS: int = 32
     """Log training metrics every N steps"""
     
-    NUM_EPOCHS: int = 1
+    NUM_EPOCHS: int = 3
     """Number of training epochs"""
     
     # ============================================================================
@@ -270,21 +270,20 @@ class Config:
     # ============================================================================
     
     QUESTION_TEXT: str = (
+        "Compare the facial attractiveness of these two images. "
         "Which face looks more attractive? "
-        "Answer with exactly one of: "
-        "\"First.\" (left image is more attractive), "
-        "\"Second.\" (right image is more attractive), "
-        "\"Similar.\" (both are similarly attractive)."
+        "Answer with exactly one word: "
+        "First (left image), Second (right image), or Similar (equally attractive)"
     )
     """Question prompt for facial attractiveness comparison task"""
     
-    ANSWER_FIRST: str = "First."
+    ANSWER_FIRST: str = "First"
     """Answer string when left image is more attractive"""
     
-    ANSWER_SECOND: str = "Second."
+    ANSWER_SECOND: str = "Second"
     """Answer string when right image is more attractive"""
     
-    ANSWER_SIMILAR: str = "Similar."
+    ANSWER_SIMILAR: str = "Similar"
     """Answer string when both images are similarly attractive"""
     
     def __post_init__(self):

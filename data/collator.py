@@ -120,7 +120,8 @@ class LlavaPairsCollator:
 
         # Build prompt prefix with image tokens
         image_token = "<image>"
-        # Note: No trailing space to ensure consistent tokenization of canonical answers
+        # Note: We add a space before the answer to ensure clean tokenization
+        # The space will be part of the answer tokens during training
         self.prompt_prefix = image_token * (self.tokens_per_image * 2) + ", " + config.QUESTION_TEXT
 
         # Calculate maximum answer length for validation
@@ -216,7 +217,7 @@ class LlavaPairsCollator:
         Args:
             img1: First image (PIL Image)
             img2: Second image (PIL Image)
-            answer_text: Answer text ("First.", "Second.", or "Similar.")
+            answer_text: Answer text ("First", "Second", or "Similar")
             input_ids_list: List to append tokenized input IDs
             attention_mask_list: List to append attention masks
             labels_list: List to append label tensors
@@ -226,21 +227,29 @@ class LlavaPairsCollator:
             prompt_prefix: Pre-built prompt prefix with image tokens
             pair_idx: Index of the current pair
         """
-        # Build complete text sequence: prompt + answer
-        full_text = prompt_prefix + answer_text
+        # Build complete text sequence: prompt + space + answer
+        # Add a space before the answer to ensure clean tokenization
+        full_text = prompt_prefix + " " + answer_text
         enc = self.tokenizer(full_text, add_special_tokens=True, truncation=True, max_length=self.max_length, return_tensors="pt")
         input_ids = enc.input_ids[0]
         
-        # Calculate answer length for masking
-        ans_ids = self.tokenizer(answer_text + self.tokenizer.eos_token, add_special_tokens=False, return_tensors="pt").input_ids[0]
-        ans_len = len(ans_ids)
+        # Calculate answer length for masking by finding where the answer starts
+        # We tokenize prompt alone to find the boundary
+        prompt_enc = self.tokenizer(prompt_prefix, add_special_tokens=True, return_tensors="pt")
+        prompt_len = prompt_enc.input_ids.shape[1]
+        
+        # The answer starts after the prompt
+        # Everything from prompt_len onwards is the answer (including space and EOS)
+        ans_start = prompt_len
+        ans_len = len(input_ids) - ans_start
 
         # Adjust answer length if necessary
-        ans_len = min(ans_len, self.max_answer_len, input_ids.shape[0])
+        ans_len = min(ans_len, self.max_answer_len, input_ids.shape[0] - ans_start)
 
         # Create labels with token-level masking
         labels = torch.full_like(input_ids, IGNORE_INDEX)
-        labels[-ans_len:] = input_ids[-ans_len:]  # Only answer tokens contribute to loss
+        if ans_len > 0 and ans_start < len(input_ids):
+            labels[ans_start:ans_start + ans_len] = input_ids[ans_start:ans_start + ans_len]  # Only answer tokens contribute to loss
 
         # Create attention mask (all tokens are valid)
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)

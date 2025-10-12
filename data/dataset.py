@@ -15,7 +15,7 @@ Key Features:
 
 Dataset Structure:
 - Each sample contains two images and a comparison label
-- Labels: "First.", "Second.", or "Similar."
+- Labels: "First", "Second", or "Similar"
 - Images are loaded on-demand for memory efficiency
 - Supports custom image loaders for different preprocessing needs
 
@@ -44,7 +44,7 @@ class PairSample:
     Attributes:
         img1: First image (PIL Image object)
         img2: Second image (PIL Image object)
-        label: Comparison label ("First.", "Second.", or "Similar.")
+        label: Comparison label ("First", "Second", or "Similar")
     """
     img1: Any  # PIL.Image.Image
     img2: Any  # PIL.Image.Image

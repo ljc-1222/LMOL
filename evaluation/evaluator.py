@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Tuple, List, Dict
 
 import torch
-from transformers import AutoProcessor
+from transformers import AutoProcessor, StoppingCriteria, StoppingCriteriaList
 from peft import PeftModel
 from tqdm import tqdm
 from PIL import Image
@@ -34,6 +34,41 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from configs.config import config
 from model import build_inference_base
 from data import read_pairs_csv, PairRecord, basic_image_loader
+
+
+class RepetitionStoppingCriteria(StoppingCriteria):
+    """Custom stopping criteria to detect and stop repetitive generation patterns."""
+    
+    def __init__(self, tokenizer, max_repetition_length: int = 10):
+        self.tokenizer = tokenizer
+        self.max_repetition_length = max_repetition_length
+        
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs) -> bool:
+        # Get the last generated tokens
+        generated_tokens = input_ids[0].tolist()
+        
+        # Check for repetitive patterns
+        if len(generated_tokens) >= self.max_repetition_length:
+            # Look for repeating patterns in the last tokens
+            last_tokens = generated_tokens[-self.max_repetition_length:]
+            
+            # Check for simple repetition (same token repeated)
+            if len(set(last_tokens)) == 1:
+                return True
+                
+            # Check for 2-token repetition patterns
+            if len(last_tokens) >= 4:
+                pattern = last_tokens[-2:]
+                if all(last_tokens[i:i+2] == pattern for i in range(0, len(last_tokens)-1, 2)):
+                    return True
+                    
+            # Check for 3-token repetition patterns
+            if len(last_tokens) >= 6:
+                pattern = last_tokens[-3:]
+                if all(last_tokens[i:i+3] == pattern for i in range(0, len(last_tokens)-2, 3)):
+                    return True
+        
+        return False
 
 
 def _tokens_per_image(processor) -> int:
@@ -101,26 +136,43 @@ def load_single_fold(fold_path: Path, model_type: str = "best") -> Tuple[PeftMod
 @torch.no_grad()
 def classify_pair(model, tokenizer, prompt_ids, prompt_attn, pixel_pair) -> str:
     """Classify a single image pair."""
+    # Create custom stopping criteria to prevent repetitive generation
+    repetition_stopper = RepetitionStoppingCriteria(tokenizer, max_repetition_length=8)
+    stopping_criteria = StoppingCriteriaList([repetition_stopper])
+    
     gen_ids = model.generate(
         input_ids=prompt_ids,
         attention_mask=prompt_attn,
         pixel_values=pixel_pair,
-        max_new_tokens=3,
-        do_sample=False,
+        max_new_tokens=5,        # Increased for better generation
+        do_sample=True,          # Enable sampling for better control
+        temperature=0.1,         # Low temperature for deterministic-like output
+        top_p=0.9,               # Nucleus sampling
+        repetition_penalty=1.5,  # Stronger penalty for repetitive tokens
+        no_repeat_ngram_size=3,  # Prevent 3-gram repetition
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
+        stopping_criteria=stopping_criteria,
     )
     gen_only = gen_ids[0, prompt_ids.size(1):]
-    # Use token-level parsing for robust matching
+    
+    # Use token-level parsing for robust matching (no need to decode to text)
     return _parse_answer(gen_only, tokenizer=tokenizer)
 
 
 @torch.no_grad()
 def _parse_answer(text_or_tokens, tokenizer=None) -> str:
-    """Parse generated answer and return canonical label."""
-    # If we were given tokens, do token-level subsequence matching
+    """Parse generated answer and return canonical label using flexible matching."""
+    # If we were given tokens, try multiple matching strategies
     if tokenizer is not None and hasattr(text_or_tokens, '__len__') and not isinstance(text_or_tokens, str):
         gen_list = text_or_tokens.tolist() if isinstance(text_or_tokens, torch.Tensor) else list(text_or_tokens)
+        
+        # Remove EOS and PAD tokens for cleaner processing
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id
+        gen_list = [t for t in gen_list if t not in [eos_id, pad_id]]
+        
+        # Strategy 1: Exact token sequence matching (original method)
         seqs = _make_label_token_seqs(tokenizer)
         earliest = None
         best = None
@@ -129,31 +181,69 @@ def _parse_answer(text_or_tokens, tokenizer=None) -> str:
             if pos >= 0 and (earliest is None or pos < earliest):
                 earliest = pos
                 best = label
+        
         if best is not None:
             return best
-        # fallback to decoding
+        
+        # Strategy 2: Flexible token matching - look for individual answer words
+        # This handles cases where the model generates different tokens for the same words
+        decoded_gen = tokenizer.decode(gen_list, skip_special_tokens=True).strip().lower()
+        
+        # Check for answer keywords in the generated text
+        if 'first' in decoded_gen and 'second' not in decoded_gen and 'similar' not in decoded_gen:
+            return config.ANSWER_FIRST
+        elif 'second' in decoded_gen and 'first' not in decoded_gen and 'similar' not in decoded_gen:
+            return config.ANSWER_SECOND
+        elif 'similar' in decoded_gen and 'first' not in decoded_gen and 'second' not in decoded_gen:
+            return config.ANSWER_SIMILAR
+        
+        # Strategy 3: Partial token matching - check if any individual tokens match
+        # This handles cases where only part of the answer tokens are generated
+        vocab = tokenizer.get_vocab()
+        
+        # Get all possible tokens for each answer word
+        first_tokens = set()
+        second_tokens = set()
+        similar_tokens = set()
+        
+        # Find all tokens that decode to "first", "second", "similar"
+        for token_text, token_id in vocab.items():
+            decoded_token = tokenizer.decode([token_id], skip_special_tokens=True).lower().strip()
+            if decoded_token == 'first':
+                first_tokens.add(token_id)
+            elif decoded_token == 'second':
+                second_tokens.add(token_id)
+            elif decoded_token == 'similar':
+                similar_tokens.add(token_id)
+        
+        # Check if any generated tokens match our answer tokens
+        gen_set = set(gen_list)
+        
+        if gen_set.intersection(first_tokens) and not gen_set.intersection(second_tokens) and not gen_set.intersection(similar_tokens):
+            return config.ANSWER_FIRST
+        elif gen_set.intersection(second_tokens) and not gen_set.intersection(first_tokens) and not gen_set.intersection(similar_tokens):
+            return config.ANSWER_SECOND
+        elif gen_set.intersection(similar_tokens) and not gen_set.intersection(first_tokens) and not gen_set.intersection(second_tokens):
+            return config.ANSWER_SIMILAR
+        
+        # Strategy 4: Text-based fallback (original fallback)
         try:
-            decoded = tokenizer.decode(gen_list, skip_special_tokens=True).lower()
-        except Exception:
-            decoded = ""
-        # Notify when falling back to decode and output the full decoded string
-        if decoded:
-            print(f"[Decode] tokenizer.decode used. Full decode: {decoded}")
-        text = decoded
-    else:
-        text = (text_or_tokens or "").strip().lower()
-
-    if 'first' in text:
-        return config.ANSWER_FIRST
-    if 'second' in text:
-        return config.ANSWER_SECOND
-    if 'similar' in text:
-        return config.ANSWER_SIMILAR
-    if '1' in text and '2' not in text:
-        return config.ANSWER_FIRST
-    if '2' in text and '1' not in text:
-        return config.ANSWER_SECOND
-    return config.ANSWER_SECOND
+            decoded = tokenizer.decode(gen_list, skip_special_tokens=True).strip()
+            if decoded:
+                print(f"[Fallback] All token matching failed, using text decode: '{decoded[:50]}{'...' if len(decoded) > 50 else ''}'")
+                # Simple text matching as last resort
+                decoded_lower = decoded.lower()
+                if 'first' in decoded_lower:
+                    return config.ANSWER_FIRST
+                if 'second' in decoded_lower:
+                    return config.ANSWER_SECOND
+                if 'similar' in decoded_lower:
+                    return config.ANSWER_SIMILAR
+        except Exception as e:
+            print(f"[Error] All parsing strategies failed: {e}")
+    
+    # If we got here, something went wrong - default to Similar
+    return config.ANSWER_SIMILAR
 
 
 @torch.no_grad()
@@ -166,6 +256,8 @@ def _make_label_token_seqs(tokenizer):
         except Exception:
             toks = tokenizer.encode(label, add_special_tokens=False)
         seqs[label] = toks
+        # Debug: Print token sequences for verification
+        print(f"[TokenSeq] '{label}' -> {toks}")
     return seqs
 
 

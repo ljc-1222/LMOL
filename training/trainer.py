@@ -178,13 +178,13 @@ class WeightedSwapConsistencyTrainer(Trainer):
         """
         Setup class token IDs for consistency loss computation.
         
-        Determines the token IDs for "First.", "Second.", and "Similar." answers
+        Determines the token IDs for "First", "Second", and "Similar" answers
         to enable robust consistency loss computation between swapped pairs.
         """
         # Get token sequences for canonical answers
-        first_text = "First."
-        second_text = "Second."
-        similar_text = "Similar."
+        first_text = "First"
+        second_text = "Second"
+        similar_text = "Similar"
         toks_first = self.tokenizer(first_text, add_special_tokens=False).input_ids
         toks_second = self.tokenizer(second_text, add_special_tokens=False).input_ids
         toks_similar = self.tokenizer(similar_text, add_special_tokens=False).input_ids
