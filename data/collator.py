@@ -120,8 +120,8 @@ class LlavaPairsCollator:
 
         # Build prompt prefix with image tokens
         image_token = "<image>"
-        # Note: We add a space before the answer to ensure clean tokenization
-        # The space will be part of the answer tokens during training
+        # Note: The prompt already ends with ": " so no additional space is needed
+        # The answer tokens start immediately after the prompt
         self.prompt_prefix = image_token * (self.tokens_per_image * 2) + ", " + config.QUESTION_TEXT
 
         # Calculate maximum answer length for validation
@@ -227,9 +227,9 @@ class LlavaPairsCollator:
             prompt_prefix: Pre-built prompt prefix with image tokens
             pair_idx: Index of the current pair
         """
-        # Build complete text sequence: prompt + space + answer
-        # Add a space before the answer to ensure clean tokenization
-        full_text = prompt_prefix + " " + answer_text
+        # Build complete text sequence: prompt + answer (no extra space)
+        # The prompt already ends with ": " so no additional space is needed
+        full_text = prompt_prefix + answer_text
         enc = self.tokenizer(full_text, add_special_tokens=True, truncation=True, max_length=self.max_length, return_tensors="pt")
         input_ids = enc.input_ids[0]
         
@@ -250,6 +250,17 @@ class LlavaPairsCollator:
         labels = torch.full_like(input_ids, IGNORE_INDEX)
         if ans_len > 0 and ans_start < len(input_ids):
             labels[ans_start:ans_start + ans_len] = input_ids[ans_start:ans_start + ans_len]  # Only answer tokens contribute to loss
+        else:
+            # CRITICAL: Log when answer span is invalid
+            print(f"[LABEL_ERROR] Invalid answer span: ans_start={ans_start}, ans_len={ans_len}, input_ids.len={len(input_ids)}")
+            print(f"[LABEL_ERROR] prompt_len={prompt_len}, full_text_len={len(input_ids)}")
+            print(f"[LABEL_ERROR] This sample will have ALL labels set to IGNORE_INDEX!")
+        
+        # Validate that at least some labels are not IGNORE_INDEX
+        valid_label_count = (labels != IGNORE_INDEX).sum().item()
+        if valid_label_count == 0:
+            print(f"[LABEL_ERROR] Sample {pair_idx} has ZERO valid labels! Loss will be zero or NaN.")
+            print(f"[LABEL_ERROR] Answer text: '{answer_text}', Prompt: '{prompt_prefix[-50:]}'")  # Last 50 chars of prompt
 
         # Create attention mask (all tokens are valid)
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)

@@ -235,11 +235,11 @@ class Config:
     """Keep all columns to avoid processing overhead"""
     
     # Mixed precision training
-    FP16: bool = True
-    """Enable 16-bit floating point precision for faster training"""
+    FP16: bool = False
+    """Enable 16-bit floating point precision for faster training (DISABLED: can cause underflow)"""
     
-    BF16: bool = False
-    """Enable bfloat16 precision (alternative to FP16)"""
+    BF16: bool = True
+    """Enable bfloat16 precision (alternative to FP16) - Better numerical stability"""
     
     # Memory optimization
     GRADIENT_CHECKPOINTING: bool = True

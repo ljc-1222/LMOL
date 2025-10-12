@@ -201,6 +201,35 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     # Count trainable layers
     trainable_layers = sum(1 for p in model.parameters() if p.requires_grad)
     print(f"  Trainable layers: {trainable_layers}\n")
+    
+    # Analyze class distribution in training data
+    print(f"Class Distribution Analysis:")
+    from collections import Counter
+    class_counts = Counter()
+    for sample in ds:
+        class_counts[sample.label] += 1
+    
+    total = sum(class_counts.values())
+    for label in sorted(class_counts.keys()):
+        count = class_counts[label]
+        print(f"  {label:8s}: {count:6,} samples ({count/total:6.2%})")
+    
+    # Check if weights are appropriate
+    print(f"\nClass Weights:")
+    print(f"  First:   1.00 (default)")
+    print(f"  Second:  1.00 (default)")
+    print(f"  Similar: {config.WSIM:.2f} (config.WSIM)")
+    
+    # Calculate recommended weights based on inverse frequency
+    if len(class_counts) == 3:
+        weight_first = total / (3 * max(class_counts.get(config.ANSWER_FIRST, 1), 1))
+        weight_second = total / (3 * max(class_counts.get(config.ANSWER_SECOND, 1), 1))
+        weight_similar = total / (3 * max(class_counts.get(config.ANSWER_SIMILAR, 1), 1))
+        print(f"\nRecommended Inverse Frequency Weights:")
+        print(f"  First:   {weight_first:.2f}")
+        print(f"  Second:  {weight_second:.2f}")
+        print(f"  Similar: {weight_similar:.2f}")
+    print()
 
     # Calculate batches per epoch
     batches_per_epoch = steps_per_epoch

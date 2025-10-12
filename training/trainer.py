@@ -137,7 +137,8 @@ class WeightedSwapConsistencyTrainer(Trainer):
             'loss': [],
             'ce_loss': [],
             'cons_loss': [],
-            'grad_norm': []
+            'grad_norm': [],
+            'train_acc': []
         }
         
         # Track accumulation steps to know when to log
@@ -302,7 +303,7 @@ class WeightedSwapConsistencyTrainer(Trainer):
         # Filter out unwanted keys to prevent them from being printed by default mechanisms
         # Keep only the keys we need for our custom logging
         filtered_logs = {}
-        for key in ['loss', 'ce_loss', 'cons_loss', 'grad_norm']:
+        for key in ['loss', 'ce_loss', 'cons_loss', 'grad_norm', 'train_acc']:
             if key in logs:
                 filtered_logs[key] = logs[key]
                 self.batch_metrics_buffer[key].append(logs[key])
@@ -372,8 +373,12 @@ class WeightedSwapConsistencyTrainer(Trainer):
         else:
             epoch_progress = 0.0
         
+        # Get training accuracy for display
+        train_acc = self.batch_metrics_buffer.get('train_acc', [0.0])[-1] if 'train_acc' in self.batch_metrics_buffer and self.batch_metrics_buffer['train_acc'] else 0.0
+        
         print(f"Batch {effective_batch_num:4d} | Epoch {epoch_progress:.5f} | "
-              f"Loss: {avg_loss:.4f} (CE: {avg_ce_loss:.4f}, Cons: {avg_cons_loss:.4f}) | "
+              f"Loss: {avg_loss:.4e} (CE: {avg_ce_loss:.4e}, Cons: {avg_cons_loss:.4e}) | "
+              f"Acc: {train_acc:.4f} | "
               f"LR: Proj = {lr_proj:.2e}, LoRA = {lr_lora:.2e} | Grad: {avg_grad_norm:.2e}")
         
         # Prepare callback logs for internal state tracking (don't print)
@@ -506,6 +511,11 @@ class WeightedSwapConsistencyTrainer(Trainer):
         # First check if there are any valid labels
         valid_mask = (labels != IGNORE_INDEX)
         if not valid_mask.any():
+            # CRITICAL: All labels are IGNORE_INDEX - this should not happen!
+            print(f"[LOSS_WARNING] Batch has NO valid labels! All labels are IGNORE_INDEX (-100)")
+            print(f"[LOSS_WARNING] This will produce zero/NaN loss. Check collator logic!")
+            print(f"[LOSS_WARNING] Batch size: {labels.shape[0]}, Seq len: {labels.shape[1]}")
+            
             # If no valid labels, fall back to original HF CE loss
             base_ce = outputs.loss
             self._last_base_ce = float(base_ce.item())
@@ -565,6 +575,81 @@ class WeightedSwapConsistencyTrainer(Trainer):
             # Store base CE (unweighted) for logging
             self._last_base_ce = float(ce_loss[flat_labels != -100].mean().item())
             self._last_ce = float(ce.item())
+            
+            # ====== ADD TRAINING ACCURACY COMPUTATION ======
+            # Compute training accuracy using argmax over answer tokens
+            with torch.no_grad():
+                # Get predictions (argmax over vocabulary)
+                preds = logits.argmax(dim=-1)  # (batch_size, seq_len)
+                
+                # Get answer token IDs from tokenizer
+                first_tokens = self.tokenizer(config.ANSWER_FIRST, add_special_tokens=False).input_ids
+                second_tokens = self.tokenizer(config.ANSWER_SECOND, add_special_tokens=False).input_ids
+                similar_tokens = self.tokenizer(config.ANSWER_SIMILAR, add_special_tokens=False).input_ids
+                
+                # Use first token of each answer as class identifier
+                first_id = first_tokens[0] if first_tokens else -1
+                second_id = second_tokens[0] if second_tokens else -1
+                similar_id = similar_tokens[0] if similar_tokens else -1
+                
+                # For each sample, find the first answer token prediction
+                batch_size = labels.shape[0]
+                pred_classes = []
+                true_classes = []
+                
+                for i in range(batch_size):
+                    # Find first non-IGNORE position (answer start)
+                    valid_positions = (labels[i] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+                    if len(valid_positions) > 0:
+                        ans_pos = valid_positions[0].item()
+                        pred_token = preds[i, ans_pos].item()
+                        true_token = labels[i, ans_pos].item()
+                        
+                        # Map token to class
+                        pred_class = -1
+                        if pred_token == first_id:
+                            pred_class = 0
+                        elif pred_token == second_id:
+                            pred_class = 1
+                        elif pred_token == similar_id:
+                            pred_class = 2
+                        
+                        true_class = -1
+                        if true_token == first_id:
+                            true_class = 0
+                        elif true_token == second_id:
+                            true_class = 1
+                        elif true_token == similar_id:
+                            true_class = 2
+                        
+                        if pred_class != -1 and true_class != -1:
+                            pred_classes.append(pred_class)
+                            true_classes.append(true_class)
+                
+                # Compute accuracy
+                if len(pred_classes) > 0:
+                    correct = sum(p == t for p, t in zip(pred_classes, true_classes))
+                    train_acc = correct / len(pred_classes)
+                    self._last_train_acc = train_acc
+                    
+                    # Compute per-class accuracy
+                    from collections import defaultdict
+                    class_correct = defaultdict(int)
+                    class_total = defaultdict(int)
+                    for p, t in zip(pred_classes, true_classes):
+                        class_total[t] += 1
+                        if p == t:
+                            class_correct[t] += 1
+                    
+                    self._last_class_acc = {
+                        'first': class_correct[0] / max(class_total[0], 1),
+                        'second': class_correct[1] / max(class_total[1], 1),
+                        'similar': class_correct[2] / max(class_total[2], 1),
+                    }
+                else:
+                    self._last_train_acc = 0.0
+                    self._last_class_acc = {}
+            # ====== END TRAINING ACCURACY COMPUTATION ======
             
             # Calculate and store CE ratio between original and swapped samples
             if swap_mask is not None and swap_mask.any():
@@ -719,26 +804,71 @@ class WeightedSwapConsistencyTrainer(Trainer):
         # Enable gradient norm logging
         self._log_grad_norm = True
         
-        # Calculate gradient norm manually for logging - only every few batches to reduce overhead
+        # Calculate gradient norm with comprehensive anomaly detection
         grad_norm = 0.0
         current_step = getattr(self.state, 'global_step', 0)
-        if hasattr(self, 'model') and self.model is not None and current_step % 5 == 0:
+        
+        # Always compute gradient norm (performance impact is minimal)
+        if hasattr(self, 'model') and self.model is not None:
             try:
                 total_norm = 0.0
                 param_count = 0
+                has_nan = False
+                has_inf = False
+                
                 for name, param in self.model.named_parameters():
                     if param.requires_grad and param.grad is not None:
                         param_norm = param.grad.data.norm(2)
+                        
+                        # Check for NaN/Inf
+                        if torch.isnan(param_norm):
+                            has_nan = True
+                            print(f"[GRAD_ERROR] NaN gradient detected in parameter: {name}")
+                        if torch.isinf(param_norm):
+                            has_inf = True
+                            print(f"[GRAD_ERROR] Inf gradient detected in parameter: {name}")
+                        
                         total_norm += param_norm.item() ** 2
                         param_count += 1
+                
                 if param_count > 0:
                     grad_norm = total_norm ** (1. / 2)
-            except Exception:
-                pass
+                    
+                    # Check for gradient anomalies
+                    if has_nan:
+                        print(f"[GRAD_ERROR] NaN gradients detected at step {current_step}!")
+                        print(f"[GRAD_ERROR] Training may be unstable. Consider reducing learning rate.")
+                    if has_inf:
+                        print(f"[GRAD_ERROR] Inf gradients detected at step {current_step}!")
+                        print(f"[GRAD_ERROR] Gradient explosion! Check learning rate and loss scaling.")
+                    if grad_norm < 1e-7 and not has_nan and current_step > 10:
+                        print(f"[GRAD_WARNING] Gradients are vanishing ({grad_norm:.10e})")
+                        print(f"[GRAD_WARNING] Model may not be learning. Check loss function and data.")
+                    if grad_norm > 1e4:
+                        print(f"[GRAD_WARNING] Gradients are very large ({grad_norm:.10e})")
+                        print(f"[GRAD_WARNING] Potential gradient explosion. Clipping should handle this.")
+            except Exception as e:
+                # Don't silently ignore exceptions - log them
+                print(f"[GRAD_ERROR] Failed to compute gradient norm: {e}")
+                import traceback
+                traceback.print_exc()
         
         # Record exact loss values for logging
         self._last_total = float(loss.detach().cpu().item())
         self._last_grad_norm = grad_norm
+        
+        # Check for loss anomalies
+        import math
+        if math.isnan(self._last_total):
+            print(f"[LOSS_ERROR] Loss is NaN at step {current_step}!")
+            print(f"[LOSS_ERROR] CE loss: {self._last_ce:.10e}, Cons loss: {self._last_cons:.10e}")
+            print(f"[LOSS_ERROR] This indicates numerical instability. Training will likely fail.")
+        if math.isinf(self._last_total):
+            print(f"[LOSS_ERROR] Loss is Inf at step {current_step}!")
+            print(f"[LOSS_ERROR] This indicates gradient explosion or overflow.")
+        if self._last_total < 1e-5 and self.args.fp16 and current_step > 10:
+            print(f"[FP16_WARNING] Loss is very small ({self._last_total:.10e}) with FP16 enabled!")
+            print(f"[FP16_WARNING] This may cause underflow. Consider switching to BF16 or FP32.")
 
         # Skip expensive tensor cleanup - let Python's garbage collector handle it
         # Manual tensor deletion is computationally expensive and unnecessary
@@ -759,6 +889,10 @@ class WeightedSwapConsistencyTrainer(Trainer):
                 "base_ce": float(self._last_base_ce) if self._last_base_ce is not None else float('nan'),
                 "ce_weight": float(self._last_weight) if self._last_weight is not None else float('nan'),
                 "grad_norm": float(self._last_grad_norm) if hasattr(self, '_last_grad_norm') else 0.0,
+                "train_acc": float(self._last_train_acc) if hasattr(self, '_last_train_acc') else 0.0,
+                "train_acc_first": float(self._last_class_acc.get('first', 0.0)) if hasattr(self, '_last_class_acc') else 0.0,
+                "train_acc_second": float(self._last_class_acc.get('second', 0.0)) if hasattr(self, '_last_class_acc') else 0.0,
+                "train_acc_similar": float(self._last_class_acc.get('similar', 0.0)) if hasattr(self, '_last_class_acc') else 0.0,
             }
             # Use Trainer.log to ensure consistent aggregation and reporting
             self.log(log_dict)

@@ -122,8 +122,45 @@ def load_single_fold(fold_path: Path, model_type: str = "best") -> Tuple[PeftMod
     print(f"[Load] {fold_path.name} ({model_type}) from {model_path}")
     processor = AutoProcessor.from_pretrained(model_path)
     tok = processor.tokenizer
-    if (tok.pad_token is None):
+    
+    # ===== VALIDATION BLOCK =====
+    # Validate tokenizer configuration to ensure consistency
+    print(f"[Validate] Tokenizer configuration:")
+    
+    # Check vocabulary size
+    vocab_size = len(tok.get_vocab())
+    expected_vocab_size = 32002  # LLaVA vocab size (LLaMA-2 32000 + 2 special tokens)
+    print(f"  - Vocabulary size: {vocab_size}")
+    if vocab_size != expected_vocab_size:
+        print(f"  ⚠️  WARNING: Expected {expected_vocab_size}, got {vocab_size}")
+    
+    # Check EOS token
+    if tok.eos_token_id is None:
+        raise ValueError("EOS token not configured in loaded tokenizer")
+    print(f"  - EOS token: {tok.eos_token} (ID: {tok.eos_token_id})")
+    
+    # Check PAD token (set to EOS if missing)
+    if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+        print(f"  - PAD token: Set to EOS token (ID: {tok.pad_token_id})")
+    else:
+        print(f"  - PAD token: {tok.pad_token} (ID: {tok.pad_token_id})")
+    
+    # Check BOS token
+    if tok.bos_token_id is not None:
+        print(f"  - BOS token: {tok.bos_token} (ID: {tok.bos_token_id})")
+    
+    # Validate answer tokenization (both capitalized and lowercase)
+    print(f"[Validate] Answer token sequences:")
+    for answer in [config.ANSWER_FIRST, config.ANSWER_SECOND, config.ANSWER_SIMILAR]:
+        toks_cap = tok(answer, add_special_tokens=False).input_ids
+        toks_lower = tok(answer.lower(), add_special_tokens=False).input_ids
+        print(f"  - '{answer}': {toks_cap}")
+        print(f"  - '{answer.lower()}': {toks_lower}")
+    
+    print(f"[Validate] ✓ Tokenizer validation complete")
+    # ===== END VALIDATION BLOCK =====
+    
     base = build_inference_base()
     model = PeftModel.from_pretrained(base, model_path, is_trainable=False)
     model.eval()
@@ -162,107 +199,106 @@ def classify_pair(model, tokenizer, prompt_ids, prompt_attn, pixel_pair) -> str:
 
 @torch.no_grad()
 def _parse_answer(text_or_tokens, tokenizer=None) -> str:
-    """Parse generated answer and return canonical label using flexible matching."""
-    # If we were given tokens, try multiple matching strategies
-    if tokenizer is not None and hasattr(text_or_tokens, '__len__') and not isinstance(text_or_tokens, str):
-        gen_list = text_or_tokens.tolist() if isinstance(text_or_tokens, torch.Tensor) else list(text_or_tokens)
-        
-        # Remove EOS and PAD tokens for cleaner processing
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id
-        gen_list = [t for t in gen_list if t not in [eos_id, pad_id]]
-        
-        # Strategy 1: Exact token sequence matching (original method)
-        seqs = _make_label_token_seqs(tokenizer)
-        earliest = None
-        best = None
-        for label, seq in seqs.items():
-            pos = _find_subsequence(gen_list, seq)
-            if pos >= 0 and (earliest is None or pos < earliest):
-                earliest = pos
-                best = label
-        
-        if best is not None:
-            return best
-        
-        # Strategy 2: Flexible token matching - look for individual answer words
-        # This handles cases where the model generates different tokens for the same words
-        decoded_gen = tokenizer.decode(gen_list, skip_special_tokens=True).strip().lower()
-        
-        # Check for answer keywords in the generated text
-        if 'first' in decoded_gen and 'second' not in decoded_gen and 'similar' not in decoded_gen:
-            return config.ANSWER_FIRST
-        elif 'second' in decoded_gen and 'first' not in decoded_gen and 'similar' not in decoded_gen:
-            return config.ANSWER_SECOND
-        elif 'similar' in decoded_gen and 'first' not in decoded_gen and 'second' not in decoded_gen:
-            return config.ANSWER_SIMILAR
-        
-        # Strategy 3: Partial token matching - check if any individual tokens match
-        # This handles cases where only part of the answer tokens are generated
-        vocab = tokenizer.get_vocab()
-        
-        # Get all possible tokens for each answer word
-        first_tokens = set()
-        second_tokens = set()
-        similar_tokens = set()
-        
-        # Find all tokens that decode to "first", "second", "similar"
-        for token_text, token_id in vocab.items():
-            decoded_token = tokenizer.decode([token_id], skip_special_tokens=True).lower().strip()
-            if decoded_token == 'first':
-                first_tokens.add(token_id)
-            elif decoded_token == 'second':
-                second_tokens.add(token_id)
-            elif decoded_token == 'similar':
-                similar_tokens.add(token_id)
-        
-        # Check if any generated tokens match our answer tokens
-        gen_set = set(gen_list)
-        
-        if gen_set.intersection(first_tokens) and not gen_set.intersection(second_tokens) and not gen_set.intersection(similar_tokens):
-            return config.ANSWER_FIRST
-        elif gen_set.intersection(second_tokens) and not gen_set.intersection(first_tokens) and not gen_set.intersection(similar_tokens):
-            return config.ANSWER_SECOND
-        elif gen_set.intersection(similar_tokens) and not gen_set.intersection(first_tokens) and not gen_set.intersection(second_tokens):
-            return config.ANSWER_SIMILAR
-        
-        # Strategy 4: Text-based fallback (original fallback)
-        try:
-            decoded = tokenizer.decode(gen_list, skip_special_tokens=True).strip()
-            if decoded:
-                print(f"[Fallback] All token matching failed, using text decode: '{decoded[:50]}{'...' if len(decoded) > 50 else ''}'")
-                # Simple text matching as last resort
-                decoded_lower = decoded.lower()
-                if 'first' in decoded_lower:
-                    return config.ANSWER_FIRST
-                if 'second' in decoded_lower:
-                    return config.ANSWER_SECOND
-                if 'similar' in decoded_lower:
-                    return config.ANSWER_SIMILAR
-        except Exception as e:
-            print(f"[Error] All parsing strategies failed: {e}")
+    """
+    Parse generated answer and return canonical label.
     
-    # If we got here, something went wrong - default to Similar
+    This simplified version expects clean token generation matching training.
+    If parsing fails, it logs the failure explicitly for debugging.
+    
+    Args:
+        text_or_tokens: Generated tokens (torch.Tensor or list)
+        tokenizer: Tokenizer for decoding (required)
+        
+    Returns:
+        Canonical answer label ("First", "Second", or "Similar")
+    """
+    if tokenizer is None:
+        raise ValueError("Tokenizer is required for answer parsing")
+    
+    # Convert to list and remove special tokens
+    if isinstance(text_or_tokens, torch.Tensor):
+        gen_list = text_or_tokens.tolist()
+    else:
+        gen_list = list(text_or_tokens)
+    
+    # Remove EOS and PAD tokens
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
+    gen_list = [t for t in gen_list if t not in [eos_id, pad_id]]
+    
+    if not gen_list:
+        print("[PARSE_WARN] Empty token sequence after filtering")
+        return config.ANSWER_SIMILAR
+    
+    # Get expected token sequences for each answer (includes case variants)
+    answer_seqs = _make_label_token_seqs(tokenizer)
+    
+    # Strategy 1: Exact prefix matching (most reliable)
+    # Check if generated tokens start with any expected answer sequence variant
+    for label, expected_seq_variants in answer_seqs.items():
+        for expected_seq in expected_seq_variants:
+            if len(gen_list) >= len(expected_seq):
+                if gen_list[:len(expected_seq)] == expected_seq:
+                    return label
+    
+    # Strategy 2: Subsequence matching (for cases where answer is not at start)
+    # This handles generation artifacts like extra tokens before the answer
+    for label, expected_seq_variants in answer_seqs.items():
+        for expected_seq in expected_seq_variants:
+            pos = _find_subsequence(gen_list, expected_seq)
+            if pos >= 0:
+                if pos <= 3:  # Only accept if answer appears within first 3 tokens
+                    print(f"[PARSE_INFO] Found '{label}' at position {pos} (not at start)")
+                    return label
+    
+    # Parsing failed - log for debugging
+    decoded = tokenizer.decode(gen_list, skip_special_tokens=True).strip()
+    print(f"[PARSE_FAIL] Generated: '{decoded}' | Tokens: {gen_list[:10]}")
+    print(f"[PARSE_FAIL] Expected one of: {list(answer_seqs.keys())}")
+    
+    # Return default (most common class to minimize false positives)
     return config.ANSWER_SIMILAR
 
 
 @torch.no_grad()
-def _make_label_token_seqs(tokenizer):
-    """Build representative token sequences for each canonical answer."""
+def _make_label_token_seqs(tokenizer) -> dict:
+    """
+    Build token sequences for each canonical answer.
+    
+    This function creates token sequences for both capitalized and lowercase versions
+    of each answer to support flexible matching during evaluation.
+    
+    Returns:
+        Dictionary mapping answer labels to list of token sequence variants
+        Example: {"First": [[123, 456], [789, 012]], ...}
+    """
     seqs = {}
     for label in (config.ANSWER_FIRST, config.ANSWER_SECOND, config.ANSWER_SIMILAR):
-        try:
-            toks = tokenizer(label, add_special_tokens=False).input_ids
-        except Exception:
-            toks = tokenizer.encode(label, add_special_tokens=False)
-        seqs[label] = toks
-        # Debug: Print token sequences for verification
-        print(f"[TokenSeq] '{label}' -> {toks}")
+        variants = [label, label.lower()]  # Both "First" and "first"
+        token_variants = []
+        for variant in variants:
+            try:
+                # Tokenize answer without special tokens
+                toks = tokenizer(variant, add_special_tokens=False).input_ids
+            except Exception:
+                toks = tokenizer.encode(variant, add_special_tokens=False)
+            if toks not in token_variants:  # Avoid duplicates
+                token_variants.append(toks)
+        seqs[label] = token_variants
     return seqs
 
 
 def _find_subsequence(haystack: list, needle: list) -> int:
-    """Find the first occurrence of needle subsequence in haystack."""
+    """
+    Find the first occurrence of needle subsequence in haystack.
+    
+    Args:
+        haystack: List to search in
+        needle: Subsequence to find
+        
+    Returns:
+        Index of first occurrence, or -1 if not found
+    """
     if not needle:
         return -1
     n = len(needle)
@@ -332,7 +368,8 @@ def evaluate_fold(fold_name: str, model, processor, eval_csv: Path, fold_path: P
         p2 = _resolve(pr.img2)
         t1 = get_pixel(p1)
         t2 = get_pixel(p2)
-        pixel_pair = torch.stack([t1, t2], dim=0).to(device, dtype=torch.bfloat16)
+        # Match training dtype for consistency (training uses float32)
+        pixel_pair = torch.stack([t1, t2], dim=0).to(device, dtype=torch.float32)
         pred_label = classify_pair(model, tokenizer, prompt_ids, prompt_attn, pixel_pair)
         y_true.append(pr.label)
         y_pred.append(pred_label)
