@@ -27,6 +27,10 @@ from peft import LoraConfig, get_peft_model
 # Fix HuggingFace tokenizers parallelism warning when using multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Allow BitsAndBytes to use CPU offloading without strict validation
+# This is needed when GPU memory is limited and some modules need to be on CPU/disk
+os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+
 from configs.config import config
 from .architecture import _find_projector_handle, _set_all_requires_grad, _report_model_sizes, _breakdown_projector
 from .projector import LMOLProjector
@@ -222,6 +226,7 @@ def build_inference_base():
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
+            llm_int8_enable_fp32_cpu_offload=True,  # Enable CPU offload for better compatibility
         )
     
     # Prepare model loading arguments
@@ -229,6 +234,7 @@ def build_inference_base():
         "torch_dtype": torch.bfloat16,
         "device_map": "auto",
         "quantization_config": quant_cfg,
+        "low_cpu_mem_usage": True,  # Reduce CPU memory usage during loading
     }
     
     # Add flash attention configuration if enabled
@@ -236,10 +242,51 @@ def build_inference_base():
         model_kwargs["attn_implementation"] = getattr(config, "FLASH_ATTENTION_BACKEND", "flash_attn")
     
     # Load base model with same configuration as training
-    model = LlavaForConditionalGeneration.from_pretrained(
-        config.MODEL_ID,
-        **model_kwargs
-    )
+    try:
+        model = LlavaForConditionalGeneration.from_pretrained(
+            config.MODEL_ID,
+            **model_kwargs
+        )
+    except ValueError as e:
+        # If quantization validation fails, try fallback strategies
+        if "validate_environment" in str(e) or "dispatched" in str(e):
+            print(f"[WARN] Quantization validation failed: {str(e)[:200]}")
+            
+            # Strategy 1: Try with explicit memory constraints
+            if torch.cuda.is_available() and "max_memory" not in model_kwargs:
+                print(f"[INFO] Retrying with explicit GPU memory allocation...")
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory
+                max_memory = {0: f"{int(gpu_memory * 0.80 / 1024**3)}GiB", "cpu": "32GiB"}
+                model_kwargs["max_memory"] = max_memory
+                print(f"[INFO] max_memory: {max_memory}")
+                try:
+                    model = LlavaForConditionalGeneration.from_pretrained(
+                        config.MODEL_ID,
+                        **model_kwargs
+                    )
+                    print(f"[INFO] Successfully loaded with explicit memory allocation")
+                except Exception as e2:
+                    print(f"[WARN] Explicit memory allocation failed: {str(e2)[:200]}")
+                    # Strategy 2: Disable quantization and load in bfloat16
+                    print(f"[INFO] Falling back to non-quantized bfloat16 loading...")
+                    model_kwargs.pop("quantization_config", None)
+                    model_kwargs.pop("max_memory", None)
+                    model = LlavaForConditionalGeneration.from_pretrained(
+                        config.MODEL_ID,
+                        **model_kwargs
+                    )
+                    print(f"[INFO] Successfully loaded without quantization (bfloat16)")
+            else:
+                # Strategy 2: Disable quantization directly
+                print(f"[INFO] Disabling quantization and retrying...")
+                model_kwargs.pop("quantization_config", None)
+                model = LlavaForConditionalGeneration.from_pretrained(
+                    config.MODEL_ID,
+                    **model_kwargs
+                )
+                print(f"[INFO] Successfully loaded without quantization")
+        else:
+            raise
     # ============================================================================
     # MODEL CONFIGURATION
     # ============================================================================

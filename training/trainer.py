@@ -583,14 +583,18 @@ class WeightedSwapConsistencyTrainer(Trainer):
                 preds = logits.argmax(dim=-1)  # (batch_size, seq_len)
                 
                 # Get answer token IDs from tokenizer
-                first_tokens = self.tokenizer(config.ANSWER_FIRST, add_special_tokens=False).input_ids
-                second_tokens = self.tokenizer(config.ANSWER_SECOND, add_special_tokens=False).input_ids
-                similar_tokens = self.tokenizer(config.ANSWER_SIMILAR, add_special_tokens=False).input_ids
+                # CRITICAL: Tokenize with leading space to match collator behavior
+                # The collator constructs: prompt + ' ' + answer_text
+                first_tokens = self.tokenizer(' ' + config.ANSWER_FIRST, add_special_tokens=False).input_ids
+                second_tokens = self.tokenizer(' ' + config.ANSWER_SECOND, add_special_tokens=False).input_ids
+                similar_tokens = self.tokenizer(' ' + config.ANSWER_SIMILAR, add_special_tokens=False).input_ids
                 
                 # Use first token of each answer as class identifier
-                first_id = first_tokens[0] if first_tokens else -1
-                second_id = second_tokens[0] if second_tokens else -1
-                similar_id = similar_tokens[0] if similar_tokens else -1
+                # With leading space: " First" -> [29871, 3824], we want the LAST token (3824)
+                # This represents the actual word token after the space token
+                first_id = first_tokens[-1] if first_tokens else -1
+                second_id = second_tokens[-1] if second_tokens else -1
+                similar_id = similar_tokens[-1] if similar_tokens else -1
                 
                 # For each sample, find the first answer token prediction
                 batch_size = labels.shape[0]

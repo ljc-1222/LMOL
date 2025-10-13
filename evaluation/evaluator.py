@@ -150,13 +150,14 @@ def load_single_fold(fold_path: Path, model_type: str = "best") -> Tuple[PeftMod
     if tok.bos_token_id is not None:
         print(f"  - BOS token: {tok.bos_token} (ID: {tok.bos_token_id})")
     
-    # Validate answer tokenization (both capitalized and lowercase)
-    print(f"[Validate] Answer token sequences:")
+    # Validate answer tokenization (with leading space to match collator)
+    print(f"[Validate] Answer token sequences (with leading space):")
     for answer in [config.ANSWER_FIRST, config.ANSWER_SECOND, config.ANSWER_SIMILAR]:
-        toks_cap = tok(answer, add_special_tokens=False).input_ids
-        toks_lower = tok(answer.lower(), add_special_tokens=False).input_ids
-        print(f"  - '{answer}': {toks_cap}")
-        print(f"  - '{answer.lower()}': {toks_lower}")
+        # CRITICAL: Add leading space to match collator tokenization
+        toks_cap = tok(' ' + answer, add_special_tokens=False).input_ids
+        toks_lower = tok(' ' + answer.lower(), add_special_tokens=False).input_ids
+        print(f"  - ' {answer}': {toks_cap}")
+        print(f"  - ' {answer.lower()}': {toks_lower}")
     
     print(f"[Validate] ✓ Tokenizer validation complete")
     # ===== END VALIDATION BLOCK =====
@@ -268,13 +269,19 @@ def _make_label_token_seqs(tokenizer) -> dict:
     This function creates token sequences for both capitalized and lowercase versions
     of each answer to support flexible matching during evaluation.
     
+    IMPORTANT: The collator constructs sequences as: prompt + ' ' + answer
+    So we must tokenize answers WITH a leading space to match training labels.
+    
     Returns:
         Dictionary mapping answer labels to list of token sequence variants
-        Example: {"First": [[123, 456], [789, 012]], ...}
+        Example: {"First": [[29871, 3824]], ...} where 29871 is space token
     """
     seqs = {}
     for label in (config.ANSWER_FIRST, config.ANSWER_SECOND, config.ANSWER_SIMILAR):
-        variants = [label, label.lower()]  # Both "First" and "first"
+        # CRITICAL: Add leading space to match collator tokenization
+        # The collator constructs: prompt + ' ' + answer_text
+        # Without the space, tokenization is different and matching will fail
+        variants = [' ' + label, ' ' + label.lower()]  # Both " First" and " first"
         token_variants = []
         for variant in variants:
             try:

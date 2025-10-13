@@ -227,19 +227,22 @@ class LlavaPairsCollator:
             prompt_prefix: Pre-built prompt prefix with image tokens
             pair_idx: Index of the current pair
         """
-        # Build complete text sequence: prompt + answer (no extra space)
-        # The prompt already ends with ": " so no additional space is needed
-        full_text = prompt_prefix + answer_text
+        # Build complete text sequence: prompt + space + answer
+        # CRITICAL: Space is required for correct tokenization!
+        # Without space: ")First" tokenizes differently than ") First"
+        full_text = prompt_prefix + ' ' + answer_text
         enc = self.tokenizer(full_text, add_special_tokens=True, truncation=True, max_length=self.max_length, return_tensors="pt")
         input_ids = enc.input_ids[0]
         
         # Calculate answer length for masking by finding where the answer starts
-        # We tokenize prompt alone to find the boundary
+        # CRITICAL: Tokenize prompt WITHOUT trailing space because the tokenizer
+        # merges " Answer" into a single token when it appears after context
+        # E.g., "prompt: First" tokenizes as [..., 29901, 3824] not [..., 29901, 29871, 3824]
         prompt_enc = self.tokenizer(prompt_prefix, add_special_tokens=True, return_tensors="pt")
         prompt_len = prompt_enc.input_ids.shape[1]
         
         # The answer starts after the prompt
-        # Everything from prompt_len onwards is the answer (including space and EOS)
+        # The space before the answer is included in the first answer token
         ans_start = prompt_len
         ans_len = len(input_ids) - ans_start
 
