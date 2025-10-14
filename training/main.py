@@ -20,7 +20,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 
 import torch
 from transformers import TrainingArguments
@@ -66,7 +66,7 @@ def _print_header(title: str):
     print(f"\n{sep}\n  {title}\n{sep}\n")
 
 
-def resolve_path(p: str | Path) -> Path:
+def resolve_path(p: Union[str, Path]) -> Path:
     """
     Convert string path to Path object if needed.
     
@@ -162,6 +162,7 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     
     # Lazy imports to avoid dependency issues
     from .trainer import WeightedSwapConsistencyTrainer
+    from .classification_trainer import LMOLClassificationTrainer
     from .callbacks import SaveBestTrainingLossCallback
     from .optimizer import group_parameters_for_optimizer, create_optimizer, create_scheduler
     
@@ -252,9 +253,15 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     print(f"  Seed:      {seed}")
     print()
 
-    # Create data collator with swap doubling
-    collator = LlavaPairsCollator(processor=processor, tokenizer=tokenizer,
-                                  max_length=config.MAX_SEQ_LEN, is_training=True)
+    # Create data collator based on training method
+    if config.USE_CLASSIFICATION_TRAINING:
+        from data.classification_collator import ClassificationCollator
+        collator = ClassificationCollator(processor, tokenizer, max_length=config.MAX_SEQ_LEN, is_training=True)
+        print(f"[TRAINING] Using classification-based training approach")
+    else:
+        collator = LlavaPairsCollator(processor=processor, tokenizer=tokenizer,
+                                      max_length=config.MAX_SEQ_LEN, is_training=True)
+        print(f"[TRAINING] Using generation-based training approach")
 
     # Configure training arguments with performance optimizations
     args = TrainingArguments(
@@ -292,23 +299,43 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     # Configure learning rate scheduler
     scheduler = create_scheduler(optimizer, total_steps, warmup_steps, config.LR_SCHEDULE_TYPE)
 
-    # Initialize custom trainer with swap consistency
-    trainer = WeightedSwapConsistencyTrainer(
-        model=model,
-        args=args,
-        data_collator=collator,
-        train_dataset=ds,
-        tokenizer=tokenizer,
-        w_sim=config.WSIM,
-        cons_weight=config.CONS_WEIGHT,
-        swap_ce_weight=getattr(config, 'SWAP_CE_WEIGHT', 1.0),
-        optimizers=(optimizer, scheduler),
-        use_dynamic_consistency=getattr(config, 'USE_DYNAMIC_CONSISTENCY', False),
-        cons_weight_start=getattr(config, 'CONS_WEIGHT_START', 5.0),
-        cons_weight_end=getattr(config, 'CONS_WEIGHT_END', 20.0),
-        cons_weight_ramp_ratio=getattr(config, 'CONS_WEIGHT_RAMP_RATIO', 0.5),
-        total_steps=total_steps,
-    )
+    # Initialize trainer based on training method
+    if config.USE_CLASSIFICATION_TRAINING:
+        # Use classification-based trainer
+        trainer = LMOLClassificationTrainer(
+            model=model,
+            args=args,
+            data_collator=collator,
+            train_dataset=ds,
+            tokenizer=tokenizer,
+            w_sim=config.WSIM,
+            cons_weight=config.CONS_WEIGHT,
+            swap_ce_weight=getattr(config, 'SWAP_CE_WEIGHT', 1.0),
+            optimizers=(optimizer, scheduler),
+            use_dynamic_consistency=getattr(config, 'USE_DYNAMIC_CONSISTENCY', False),
+            cons_weight_start=getattr(config, 'CONS_WEIGHT_START', 5.0),
+            cons_weight_end=getattr(config, 'CONS_WEIGHT_END', 20.0),
+            cons_weight_ramp_ratio=getattr(config, 'CONS_WEIGHT_RAMP_RATIO', 0.5),
+            total_steps=total_steps,
+        )
+    else:
+        # Use generation-based trainer
+        trainer = WeightedSwapConsistencyTrainer(
+            model=model,
+            args=args,
+            data_collator=collator,
+            train_dataset=ds,
+            tokenizer=tokenizer,
+            w_sim=config.WSIM,
+            cons_weight=config.CONS_WEIGHT,
+            swap_ce_weight=getattr(config, 'SWAP_CE_WEIGHT', 1.0),
+            optimizers=(optimizer, scheduler),
+            use_dynamic_consistency=getattr(config, 'USE_DYNAMIC_CONSISTENCY', False),
+            cons_weight_start=getattr(config, 'CONS_WEIGHT_START', 5.0),
+            cons_weight_end=getattr(config, 'CONS_WEIGHT_END', 20.0),
+            cons_weight_ramp_ratio=getattr(config, 'CONS_WEIGHT_RAMP_RATIO', 0.5),
+            total_steps=total_steps,
+        )
 
     # Add callback for automatic model saving
     best_dir = out_dir / "best"
@@ -330,7 +357,8 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     last_dir.mkdir(parents=True, exist_ok=True)
     try:
         trainer.save_model(str(last_dir))
-    except Exception:
+    except (OSError, RuntimeError) as e:
+        print(f"[WARN] Failed to save model via trainer.save_model: {e}")
         torch.save(model.state_dict(), last_dir / "pytorch_model.bin")
     
     try:
@@ -338,7 +366,7 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
         tokenizer.save_pretrained(last_dir)
         processor.save_pretrained(last_dir)
         print(f"[INFO] Final model saved to {last_dir}")
-    except Exception as e:
+    except (OSError, RuntimeError, AttributeError) as e:
         print(f"[WARN] Failed to save final model: {e}")
     
     # Report best model saved by callback
@@ -347,7 +375,7 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
         try:
             best_meta = json.loads(best_meta_path.read_text(encoding="utf-8"))
             print(f"[TRAINING COMPLETE] Best model: loss = {best_meta.get('best_loss', 'N/A'):.6f} | Step: {best_meta.get('global_step', 'N/A'):,} | Epoch: {best_meta.get('epoch', 'N/A'):.2f} | Saved to: {best_dir}")
-        except Exception as e:
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
             print(f"[INFO] Best model saved to {best_dir} (metadata parsing failed: {e})")
     else:
         print("[WARNING] No best model was saved during training")

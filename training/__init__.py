@@ -21,6 +21,11 @@ def WeightedSwapConsistencyTrainer(*args, **kwargs):
     from .trainer import WeightedSwapConsistencyTrainer as _WeightedSwapConsistencyTrainer
     return _WeightedSwapConsistencyTrainer(*args, **kwargs)
 
+def LMOLClassificationTrainer(*args, **kwargs):
+    """Lazy import of LMOLClassificationTrainer."""
+    from .classification_trainer import LMOLClassificationTrainer as _LMOLClassificationTrainer
+    return _LMOLClassificationTrainer(*args, **kwargs)
+
 def SaveBestTrainingLossCallback(*args, **kwargs):
     """Lazy import of SaveBestTrainingLossCallback."""
     from .callbacks import SaveBestTrainingLossCallback as _SaveBestTrainingLossCallback
@@ -43,6 +48,7 @@ def training_main(*args, **kwargs):
 
 __all__ = [
     "WeightedSwapConsistencyTrainer",
+    "LMOLClassificationTrainer",
     "SaveBestTrainingLossCallback", 
     "group_parameters_for_optimizer",
     "train_one_fold",

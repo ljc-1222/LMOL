@@ -172,30 +172,82 @@ def load_single_fold(fold_path: Path, model_type: str = "best") -> Tuple[PeftMod
 
 
 @torch.no_grad()
-def classify_pair(model, tokenizer, prompt_ids, prompt_attn, pixel_pair) -> str:
-    """Classify a single image pair."""
-    # Create custom stopping criteria to prevent repetitive generation
-    repetition_stopper = RepetitionStoppingCriteria(tokenizer, max_repetition_length=8)
-    stopping_criteria = StoppingCriteriaList([repetition_stopper])
+def classify_pair(model, tokenizer, prompt_ids, prompt_attn, pixel_pair, use_constrained_generation=True) -> str:
+    """
+    Classify a single image pair.
     
-    gen_ids = model.generate(
-        input_ids=prompt_ids,
-        attention_mask=prompt_attn,
-        pixel_values=pixel_pair,
-        max_new_tokens=5,        # Increased for better generation
-        do_sample=True,          # Enable sampling for better control
-        temperature=0.1,         # Low temperature for deterministic-like output
-        top_p=0.9,               # Nucleus sampling
-        repetition_penalty=1.5,  # Stronger penalty for repetitive tokens
-        no_repeat_ngram_size=3,  # Prevent 3-gram repetition
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        stopping_criteria=stopping_criteria,
-    )
-    gen_only = gen_ids[0, prompt_ids.size(1):]
+    Args:
+        model: LMOL model
+        tokenizer: HuggingFace tokenizer
+        prompt_ids: Input prompt token IDs
+        prompt_attn: Attention mask
+        pixel_pair: Pixel values for image pair
+        use_constrained_generation: If True, force model to only output valid answer tokens
+        
+    Returns:
+        Predicted answer: "First", "Second", or "Similar"
+    """
+    # NEW: Use constrained generation to guarantee valid outputs
+    if use_constrained_generation:
+        try:
+            from utils.constrained_generation import AnswerConstraintProcessor
+            
+            # Create processor to restrict outputs to 3 answer tokens
+            processor = AnswerConstraintProcessor(tokenizer, verbose=False)
+            
+            # Generate with constraint - only 1 token needed
+            gen_ids = model.generate(
+                input_ids=prompt_ids,
+                attention_mask=prompt_attn,
+                pixel_values=pixel_pair,
+                max_new_tokens=1,           # Only need 1 token for classification
+                do_sample=False,             # Greedy decoding for deterministic results
+                logits_processor=[processor], # FORCE valid outputs only
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            
+            # Extract generated token
+            generated_token = gen_ids[0, -1].item()
+            
+            # Convert to answer string (guaranteed to be valid)
+            answer = processor.get_answer_from_token_id(generated_token)
+            if answer is None:
+                # This should NEVER happen with constrained generation
+                raise RuntimeError(f"Constrained generation failed! Generated invalid token: {generated_token}")
+            
+            return answer
+        except ImportError:
+            print("[WARN] Constrained generation not available, falling back to unconstrained generation")
+            # Fall through to unconstrained generation
+        except Exception as e:
+            print(f"[WARN] Constrained generation failed: {e}, falling back to unconstrained generation")
+            # Fall through to unconstrained generation
     
-    # Use token-level parsing for robust matching (no need to decode to text)
-    return _parse_answer(gen_only, tokenizer=tokenizer)
+    # OLD: Original generation without constraints (kept for backwards compatibility)
+    else:
+        # Create custom stopping criteria to prevent repetitive generation
+        repetition_stopper = RepetitionStoppingCriteria(tokenizer, max_repetition_length=8)
+        stopping_criteria = StoppingCriteriaList([repetition_stopper])
+        
+        gen_ids = model.generate(
+            input_ids=prompt_ids,
+            attention_mask=prompt_attn,
+            pixel_values=pixel_pair,
+            max_new_tokens=5,        # Increased for better generation
+            do_sample=True,          # Enable sampling for better control
+            temperature=0.1,         # Low temperature for deterministic-like output
+            top_p=0.9,               # Nucleus sampling
+            repetition_penalty=1.5,  # Stronger penalty for repetitive tokens
+            no_repeat_ngram_size=3,  # Prevent 3-gram repetition
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            stopping_criteria=stopping_criteria,
+        )
+        gen_only = gen_ids[0, prompt_ids.size(1):]
+        
+        # Use token-level parsing for robust matching (no need to decode to text)
+        return _parse_answer(gen_only, tokenizer=tokenizer)
 
 
 @torch.no_grad()
@@ -376,7 +428,10 @@ def evaluate_fold(fold_name: str, model, processor, eval_csv: Path, fold_path: P
         t1 = get_pixel(p1)
         t2 = get_pixel(p2)
         # Match training dtype for consistency (training uses float32)
-        pixel_pair = torch.stack([t1, t2], dim=0).to(device, dtype=torch.float32)
+        # Ensure both tensors are on the same device before stacking
+        t1 = t1.to(device, dtype=torch.float32)
+        t2 = t2.to(device, dtype=torch.float32)
+        pixel_pair = torch.stack([t1, t2], dim=0)
         pred_label = classify_pair(model, tokenizer, prompt_ids, prompt_attn, pixel_pair)
         y_true.append(pr.label)
         y_pred.append(pred_label)

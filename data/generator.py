@@ -134,7 +134,8 @@ def build_offline_balanced_pairs(
                         if near_trials >= NEAR_TRIAL_CAP:
                             # Fallback to standard Similar rule if we've tried too many times
                             print(f"Warning: Reached near-band trial cap ({NEAR_TRIAL_CAP}). Falling back to standard Similar rule.")
-                            buckets[config.ANSWER_SIMILAR].append((f1, f2, s1, s2, config.ANSWER_SIMILAR))
+                            # Don't add the current pair, just continue with standard logic
+                            continue
                 else:
                     # Standard Similar rule
                     buckets[config.ANSWER_SIMILAR].append((f1, f2, s1, s2, config.ANSWER_SIMILAR))

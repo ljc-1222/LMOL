@@ -36,6 +36,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from configs.config import config
 from utils.constants import IGNORE_INDEX
 from utils.memory_manager import MemoryManager, get_memory_manager
+from .health_monitor import HealthMonitoringCallback
 
 
 class WeightedSwapConsistencyTrainer(Trainer):
@@ -70,6 +71,7 @@ class WeightedSwapConsistencyTrainer(Trainer):
                  cons_weight_ramp_ratio=0.5, total_steps=None, 
                  enable_memory_cleanup=getattr(config, 'ENABLE_MEMORY_CLEANUP', True), 
                  memory_cleanup_frequency=getattr(config, 'MEMORY_CLEANUP_FREQUENCY', 10),
+                 use_logit_masking=getattr(config, 'USE_LOGIT_MASKING', True),  # NEW: Enable logit masking to 3 answer tokens
                  **kwargs):
         """
         Initialize the WeightedSwapConsistencyTrainer.
@@ -124,6 +126,7 @@ class WeightedSwapConsistencyTrainer(Trainer):
         self.cons_weight = float(cons_weight)
         self.swap_ce_weight = float(swap_ce_weight)
         self.forward_strategy = forward_strategy
+        self.use_logit_masking = bool(use_logit_masking)  # NEW: Store logit masking flag
         
         # Dynamic consistency weight configuration
         self.use_dynamic_consistency = use_dynamic_consistency
@@ -174,6 +177,10 @@ class WeightedSwapConsistencyTrainer(Trainer):
                 self.model = torch.compile(self.model, mode='reduce-overhead')
             except Exception as e:
                 print(f"[WARN] torch.compile failed: {e}, continuing without compilation")
+        
+        # Add health monitoring callback
+        if config.MONITOR_GRADIENT_NORMS or config.MONITOR_LOSS_ANOMALIES or config.LOG_PER_CLASS_ACCURACY:
+            self.add_callback(HealthMonitoringCallback())
         
     def _setup_class_token_ids(self):
         """
@@ -327,6 +334,8 @@ class WeightedSwapConsistencyTrainer(Trainer):
         avg_cons_loss = sum(self.batch_metrics_buffer['cons_loss']) / len(self.batch_metrics_buffer['cons_loss']) if self.batch_metrics_buffer['cons_loss'] else 0.0
         # Use the last grad_norm (final accumulated gradient) rather than average
         avg_grad_norm = self.batch_metrics_buffer['grad_norm'][-1] if self.batch_metrics_buffer['grad_norm'] else 0.0
+        # Get training accuracy (use last value from buffer)
+        train_acc = self.batch_metrics_buffer['train_acc'][-1] if self.batch_metrics_buffer.get('train_acc') else 0.0
         
         # Clear buffers for next batch
         for key in self.batch_metrics_buffer:
@@ -373,12 +382,13 @@ class WeightedSwapConsistencyTrainer(Trainer):
         else:
             epoch_progress = 0.0
         
-        # Get training accuracy for display
-        train_acc = self.batch_metrics_buffer.get('train_acc', [0.0])[-1] if 'train_acc' in self.batch_metrics_buffer and self.batch_metrics_buffer['train_acc'] else 0.0
+        # Training accuracy already computed above (before buffer clear)
         
+        # Training accuracy is disabled because model can see the answer during training
+        # Real accuracy is measured during evaluation when model only sees the prompt
         print(f"Batch {effective_batch_num:4d} | Epoch {epoch_progress:.5f} | "
               f"Loss: {avg_loss:.4e} (CE: {avg_ce_loss:.4e}, Cons: {avg_cons_loss:.4e}) | "
-              f"Acc: {train_acc:.4f} | "
+              f"Acc: N/A (disabled) | "
               f"LR: Proj = {lr_proj:.2e}, LoRA = {lr_lora:.2e} | Grad: {avg_grad_norm:.2e}")
         
         # Prepare callback logs for internal state tracking (don't print)
@@ -474,8 +484,21 @@ class WeightedSwapConsistencyTrainer(Trainer):
         Returns:
             Loss tensor (and optionally model outputs)
         """
-        label_ids: torch.Tensor | None = inputs.pop("label_ids", None)
-        pair_ids: torch.Tensor | None = inputs.pop("pair_ids", None)
+        label_ids: Optional[torch.Tensor] = inputs.pop("label_ids", None)
+        pair_ids: Optional[torch.Tensor] = inputs.pop("pair_ids", None)
+        
+        # Defensive validation: Check if any valid labels exist (first batch only)
+        if not hasattr(self, '_first_batch_validated'):
+            labels = inputs.get("labels")
+            if labels is not None:
+                valid_labels = (labels != IGNORE_INDEX).sum().item()
+                if valid_labels == 0:
+                    raise RuntimeError(
+                        f"[BUG] ALL labels are IGNORE_INDEX! No loss signal available.\n"
+                        f"This indicates a bug in the data collator or tokenization.\n"
+                        f"Batch shape: {labels.shape}"
+                    )
+            self._first_batch_validated = True
         
         # Get model outputs (suppress stdout on first batch to avoid verbose transformers messages)
         if not self._first_batch_complete:
@@ -523,136 +546,143 @@ class WeightedSwapConsistencyTrainer(Trainer):
             self._last_weight = 1.0
             ce = base_ce
         else:
-            # Create weights for each sample
-            batch_size = labels.shape[0]
-            weights = torch.ones(batch_size, dtype=torch.float32, device=labels.device)
-            
-            # Apply class weights (Similar=2 gets WSIM weight)
-            if label_ids is not None:
-                weights[label_ids == 2] = float(config.WSIM)
-                
-                # Apply swap weights if needed
-                if swap_mask is not None:
-                    weights[swap_mask] *= self.swap_ce_weight
-                
-                # Record weight info
-                self._last_weight = float(weights.mean().item()) if weights.numel() > 0 else 1.0
-            
-            # Compute per-token CE loss using PyTorch's built-in function
-            # This is more numerically stable than manual log_softmax + gather
-            flat_logits = logits.reshape(-1, logits.size(-1))
-            flat_labels = labels.reshape(-1)
-            
-            # Apply sample weights to each token
-            token_weights = None
-            if weights is not None:
-                # Map sample weights to token weights
-                batch_size, seq_len = labels.shape
-                sample_indices = torch.div(torch.arange(batch_size * seq_len, device=labels.device), 
-                                         seq_len, rounding_mode='floor')
-                token_weights = weights.gather(dim=0, index=sample_indices)
-                token_weights = token_weights * (flat_labels != IGNORE_INDEX).float()
-                
-                # Normalize weights
-                weight_sum = token_weights.sum()
-                if weight_sum > 0:
-                    token_weights = token_weights / weight_sum
-            
-            # Compute loss with PyTorch's cross_entropy
-            ce_loss = torch.nn.functional.cross_entropy(
-                flat_logits, 
-                flat_labels,
-                ignore_index=-100,
-                reduction='none'
-            )
-            
-            # Apply weights if needed
-            if token_weights is not None and token_weights.sum() > 0:
-                ce = (ce_loss * token_weights).sum()
-            else:
-                ce = ce_loss.mean()
-            
-            # Store base CE (unweighted) for logging
-            self._last_base_ce = float(ce_loss[flat_labels != -100].mean().item())
-            self._last_ce = float(ce.item())
-            
-            # ====== ADD TRAINING ACCURACY COMPUTATION ======
-            # Compute training accuracy using argmax over answer tokens
-            with torch.no_grad():
-                # Get predictions (argmax over vocabulary)
-                preds = logits.argmax(dim=-1)  # (batch_size, seq_len)
-                
-                # Get answer token IDs from tokenizer
-                # CRITICAL: Tokenize with leading space to match collator behavior
-                # The collator constructs: prompt + ' ' + answer_text
-                first_tokens = self.tokenizer(' ' + config.ANSWER_FIRST, add_special_tokens=False).input_ids
-                second_tokens = self.tokenizer(' ' + config.ANSWER_SECOND, add_special_tokens=False).input_ids
-                similar_tokens = self.tokenizer(' ' + config.ANSWER_SIMILAR, add_special_tokens=False).input_ids
-                
-                # Use first token of each answer as class identifier
-                # With leading space: " First" -> [29871, 3824], we want the LAST token (3824)
-                # This represents the actual word token after the space token
-                first_id = first_tokens[-1] if first_tokens else -1
-                second_id = second_tokens[-1] if second_tokens else -1
-                similar_id = similar_tokens[-1] if similar_tokens else -1
-                
-                # For each sample, find the first answer token prediction
+            # ============================================================================
+            # NEW: LOGIT MASKING APPROACH - Compute CE loss on only 3 answer tokens
+            # ============================================================================
+            if self.use_logit_masking and label_ids is not None:
+                # Find answer positions (first non-IGNORE token for each sample)
                 batch_size = labels.shape[0]
-                pred_classes = []
-                true_classes = []
+                answer_positions = self._answer_start_positions(labels)
                 
-                for i in range(batch_size):
-                    # Find first non-IGNORE position (answer start)
-                    valid_positions = (labels[i] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
-                    if len(valid_positions) > 0:
-                        ans_pos = valid_positions[0].item()
-                        pred_token = preds[i, ans_pos].item()
-                        true_token = labels[i, ans_pos].item()
-                        
-                        # Map token to class
-                        pred_class = -1
-                        if pred_token == first_id:
-                            pred_class = 0
-                        elif pred_token == second_id:
-                            pred_class = 1
-                        elif pred_token == similar_id:
-                            pred_class = 2
-                        
-                        true_class = -1
-                        if true_token == first_id:
-                            true_class = 0
-                        elif true_token == second_id:
-                            true_class = 1
-                        elif true_token == similar_id:
-                            true_class = 2
-                        
-                        if pred_class != -1 and true_class != -1:
-                            pred_classes.append(pred_class)
-                            true_classes.append(true_class)
+                # Extract logits at answer positions
+                batch_indices = torch.arange(batch_size, device=logits.device)
+                answer_logits_full = logits[batch_indices, answer_positions, :]  # (N, vocab_size=32000)
                 
-                # Compute accuracy
-                if len(pred_classes) > 0:
-                    correct = sum(p == t for p, t in zip(pred_classes, true_classes))
-                    train_acc = correct / len(pred_classes)
-                    self._last_train_acc = train_acc
+                # Mask to only 3 valid answer tokens
+                valid_token_ids = torch.tensor([
+                    self.cls_first_id,   # Token for "First" (e.g., 3824)
+                    self.cls_second_id,  # Token for "Second" (e.g., 6440)
+                    self.cls_sim_id,     # Token for "Similar" (e.g., 13999)
+                ], device=logits.device)
+                
+                answer_logits_masked = answer_logits_full[:, valid_token_ids]  # (N, 3)
+                
+                # Create class weights
+                # CRITICAL FIX: Use same dtype as logits for mixed precision training
+                class_weights = torch.ones(3, dtype=answer_logits_masked.dtype, device=logits.device)
+                class_weights[2] = float(self.w_sim)  # Similar class gets WSIM weight
+                
+                # Apply swap weights to samples (not classes)
+                # CRITICAL FIX: Use same dtype as logits for mixed precision training
+                sample_weights = torch.ones(batch_size, dtype=answer_logits_masked.dtype, device=logits.device)
+                if swap_mask is not None:
+                    sample_weights[swap_mask] = self.swap_ce_weight
+                
+                # Compute CE loss on 3-class problem with class weights
+                # We'll manually apply both class weights and sample weights
+                
+                # CRITICAL FIX: Ensure consistent data types for mixed precision training
+                # Convert all tensors to the same dtype as the model's logits
+                target_dtype = answer_logits_masked.dtype
+                label_ids_casted = label_ids.to(dtype=torch.long)  # Labels must be long
+                class_weights_casted = class_weights.to(dtype=target_dtype)
+                
+                ce_loss_per_sample = torch.nn.functional.cross_entropy(
+                    answer_logits_masked,  # (N, 3)
+                    label_ids_casted,      # (N,) with values 0, 1, or 2
+                    weight=class_weights_casted,  # (3,) class weights
+                    reduction='none'       # Get per-sample loss
+                )
+                
+                # Apply sample weights
+                ce = (ce_loss_per_sample * sample_weights).mean()
+                
+                # Store for logging
+                self._last_base_ce = float(ce_loss_per_sample.mean().item())
+                self._last_ce = float(ce.item())
+                self._last_weight = float(sample_weights.mean().item())
+                
+                # Store additional info for logging
+                if not hasattr(self, '_log_logit_masking_once'):
+                    print(f"\n[LOGIT_MASKING] Training with logit masking enabled")
+                    print(f"[LOGIT_MASKING] Only considering 3 answer tokens: {valid_token_ids.tolist()}")
+                    print(f"[LOGIT_MASKING] Class weights: First=1.0, Second=1.0, Similar={self.w_sim:.2f}")
+                    self._log_logit_masking_once = True
+                
+            # ============================================================================
+            # OLD: FULL VOCABULARY APPROACH (Fallback or when logit masking disabled)
+            # ============================================================================
+            else:
+                # Create weights for each sample
+                batch_size = labels.shape[0]
+                weights = torch.ones(batch_size, dtype=torch.float32, device=labels.device)
+                
+                # Apply class weights (Similar=2 gets WSIM weight)
+                if label_ids is not None:
+                    weights[label_ids == 2] = float(config.WSIM)
                     
-                    # Compute per-class accuracy
-                    from collections import defaultdict
-                    class_correct = defaultdict(int)
-                    class_total = defaultdict(int)
-                    for p, t in zip(pred_classes, true_classes):
-                        class_total[t] += 1
-                        if p == t:
-                            class_correct[t] += 1
+                    # Apply swap weights if needed
+                    if swap_mask is not None:
+                        weights[swap_mask] *= self.swap_ce_weight
                     
-                    self._last_class_acc = {
-                        'first': class_correct[0] / max(class_total[0], 1),
-                        'second': class_correct[1] / max(class_total[1], 1),
-                        'similar': class_correct[2] / max(class_total[2], 1),
-                    }
+                    # Record weight info
+                    self._last_weight = float(weights.mean().item()) if weights.numel() > 0 else 1.0
+                
+                # Compute per-token CE loss using PyTorch's built-in function
+                # This is more numerically stable than manual log_softmax + gather
+                flat_logits = logits.reshape(-1, logits.size(-1))
+                flat_labels = labels.reshape(-1)
+                
+                # Apply sample weights to each token
+                token_weights = None
+                if weights is not None:
+                    # Map sample weights to token weights
+                    batch_size, seq_len = labels.shape
+                    sample_indices = torch.div(torch.arange(batch_size * seq_len, device=labels.device), 
+                                             seq_len, rounding_mode='floor')
+                    token_weights = weights.gather(dim=0, index=sample_indices)
+                    token_weights = token_weights * (flat_labels != IGNORE_INDEX).float()
+                    
+                    # Normalize weights
+                    weight_sum = token_weights.sum()
+                    if weight_sum > 0:
+                        token_weights = token_weights / weight_sum
+                
+                # Compute loss with PyTorch's cross_entropy
+                ce_loss = torch.nn.functional.cross_entropy(
+                    flat_logits, 
+                    flat_labels,
+                    ignore_index=-100,
+                    reduction='none'
+                )
+                
+                # Apply weights if needed
+                if token_weights is not None and token_weights.sum() > 0:
+                    ce = (ce_loss * token_weights).sum()
                 else:
-                    self._last_train_acc = 0.0
-                    self._last_class_acc = {}
+                    ce = ce_loss.mean()
+                
+                # Store base CE (unweighted) for logging
+                self._last_base_ce = float(ce_loss[flat_labels != -100].mean().item())
+                self._last_ce = float(ce.item())
+            
+            # ====== TRAINING ACCURACY COMPUTATION ======
+            # DISABLED: Training accuracy is misleading because model can see the answer
+            # During training, the model sees the full sequence (prompt + answer)
+            # so it can just copy the answer, leading to fake 100% accuracy
+            # Real accuracy should be measured during evaluation when model only sees the prompt
+            
+            # Set dummy values to avoid errors
+            self._last_train_acc = 0.0
+            self._last_class_acc = {
+                'first': 0.0,
+                'second': 0.0,
+                'similar': 0.0,
+            }
+            
+            # Note: The old accuracy computation is disabled because it was misleading
+            # The model could see the answer in the input sequence, leading to fake 100% accuracy
+            # Real accuracy should be measured during evaluation when model only sees the prompt
             # ====== END TRAINING ACCURACY COMPUTATION ======
             
             # Calculate and store CE ratio between original and swapped samples
@@ -716,48 +746,57 @@ class WeightedSwapConsistencyTrainer(Trainer):
                         break
                 
                 if pairs_aligned:
-                    # Get answer start positions more robustly
-                    starts, ends = self._get_answer_ranges(labels)
-                    
-                    # For each sample, get the class token position (if available)
-                    cls_positions = []
-                    cls_ids_tensor = torch.tensor([self.cls_first_id, self.cls_second_id, self.cls_sim_id], 
-                                            device=logits.device)
-                    
-                    for i in range(N):
-                        # Check if we have a valid answer range
-                        if ends[i] > starts[i]:
-                            # Extract just the answer span
-                            answer_logits = logits[i, starts[i]:ends[i]]
-                            
-                            # Find position with highest class activation (vectorized)
-                            cls_logits = torch.stack([
-                                answer_logits[:, self.cls_first_id],
-                                answer_logits[:, self.cls_second_id],
-                                answer_logits[:, self.cls_sim_id]
-                            ], dim=-1)
-                            
-                            # Get max activation across class tokens per position
-                            max_cls_activations, _ = cls_logits.max(dim=-1)
-                            
-                            # Find position with highest activation
-                            if max_cls_activations.numel() > 0:
-                                best_pos = max_cls_activations.argmax().item()
-                                cls_positions.append(starts[i] + best_pos)
+                    # ============================================================================
+                    # Get 3-class logits for consistency computation
+                    # ============================================================================
+                    if self.use_logit_masking and label_ids is not None:
+                        # NEW: Use already computed masked logits for consistency
+                        # This is more efficient and consistent with CE loss
+                        cls_logits = answer_logits_masked  # (N, 3) - already computed above
+                    else:
+                        # OLD: Extract class logits from full vocabulary logits
+                        # Get answer start positions more robustly
+                        starts, ends = self._get_answer_ranges(labels)
+                        
+                        # For each sample, get the class token position (if available)
+                        cls_positions = []
+                        cls_ids_tensor = torch.tensor([self.cls_first_id, self.cls_second_id, self.cls_sim_id], 
+                                                device=logits.device)
+                        
+                        for i in range(N):
+                            # Check if we have a valid answer range
+                            if ends[i] > starts[i]:
+                                # Extract just the answer span
+                                answer_logits = logits[i, starts[i]:ends[i]]
+                                
+                                # Find position with highest class activation (vectorized)
+                                cls_logits_local = torch.stack([
+                                    answer_logits[:, self.cls_first_id],
+                                    answer_logits[:, self.cls_second_id],
+                                    answer_logits[:, self.cls_sim_id]
+                                ], dim=-1)
+                                
+                                # Get max activation across class tokens per position
+                                max_cls_activations, _ = cls_logits_local.max(dim=-1)
+                                
+                                # Find position with highest activation
+                                if max_cls_activations.numel() > 0:
+                                    best_pos = max_cls_activations.argmax().item()
+                                    cls_positions.append(starts[i] + best_pos)
+                                else:
+                                    cls_positions.append(starts[i])  # Default to first position
                             else:
                                 cls_positions.append(starts[i])  # Default to first position
-                        else:
-                            cls_positions.append(starts[i])  # Default to first position
-                    
-                    # Convert to tensor
-                    cls_positions = torch.tensor(cls_positions, device=logits.device)
-                    
-                    # Get class token logits for each sample
-                    batch_indices = torch.arange(N, device=logits.device)
-                    ans_logits = logits[batch_indices, cls_positions]  # (N, V)
-                    
-                    # Get logits for the three class tokens
-                    cls_logits = ans_logits.index_select(-1, cls_ids_tensor)  # (N, 3)
+                        
+                        # Convert to tensor
+                        cls_positions = torch.tensor(cls_positions, device=logits.device)
+                        
+                        # Get class token logits for each sample
+                        batch_indices = torch.arange(N, device=logits.device)
+                        ans_logits = logits[batch_indices, cls_positions]  # (N, V)
+                        
+                        # Get logits for the three class tokens
+                        cls_logits = ans_logits.index_select(-1, cls_ids_tensor)  # (N, 3)
                     
                     # Compute log probabilities for KL divergence
                     log_probs = torch.log_softmax(cls_logits, dim=-1)  # (N, 3)

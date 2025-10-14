@@ -117,7 +117,7 @@ class Config:
     LORA_ALPHA: int = 32
     """LoRA alpha parameter (scaling factor for adaptation)"""
     
-    LORA_DROPOUT: float = 0.05
+    LORA_DROPOUT: float = 0.1
     """LoRA dropout rate for regularization"""
     
     # ============================================================================
@@ -156,17 +156,17 @@ class Config:
     DATALOADER_DROP_LAST: bool = True
     """Drop incomplete batches for consistent batch sizes"""
     
-    DATALOADER_PREFETCH_FACTOR: int = 8
+    DATALOADER_PREFETCH_FACTOR: int = 4
     """Number of batches to prefetch per worker"""
     
     # Learning rate configuration
-    LR_LORA: float = 1e-4
+    LR_LORA: float = 5e-5
     """Learning rate for LoRA parameters (adapts pretrained weights)"""
     
-    LR_PROJECTION: float = 2e-3
+    LR_PROJECTION: float = 5e-4
     """Learning rate for projector parameters (learns from scratch)"""
     
-    WEIGHT_DECAY: float = 0.01
+    WEIGHT_DECAY: float = 0.1
     """Weight decay regularization coefficient"""
     
     LOGGING_STEPS: int = 32
@@ -176,8 +176,55 @@ class Config:
     """Number of training epochs"""
     
     # ============================================================================
+    # TRAINING METHOD CONFIGURATION
+    # ============================================================================
+    
+    # Training approach selection
+    USE_CLASSIFICATION_TRAINING: bool = True
+    """Use classification-based training instead of generation-based training"""
+    
+    # ============================================================================
+    # TRAINING HEALTH MONITORING
+    # ============================================================================
+    
+    # Early stopping configuration
+    USE_EARLY_STOPPING: bool = True
+    """Enable early stopping based on validation loss"""
+    
+    EARLY_STOPPING_PATIENCE: int = 5
+    """Number of epochs to wait before stopping if no improvement"""
+    
+    EARLY_STOPPING_MIN_DELTA: float = 1e-4
+    """Minimum change to qualify as an improvement"""
+    
+    # Gradient monitoring
+    MONITOR_GRADIENT_NORMS: bool = True
+    """Enable gradient norm monitoring and warnings"""
+    
+    GRADIENT_NORM_THRESHOLD: float = 10.0
+    """Threshold for gradient norm warnings (explosion detection)"""
+    
+    GRADIENT_NORM_MIN_THRESHOLD: float = 1e-6
+    """Minimum threshold for gradient norm warnings (vanishing detection)"""
+    
+    # Per-class accuracy monitoring
+    LOG_PER_CLASS_ACCURACY: bool = True
+    """Enable per-class accuracy logging during training"""
+    
+    # Loss monitoring
+    MONITOR_LOSS_ANOMALIES: bool = True
+    """Enable loss anomaly detection (NaN, Inf, too small)"""
+    
+    MIN_REASONABLE_LOSS: float = 1e-6
+    """Minimum reasonable loss value (below this triggers warning)"""
+    
+    # ============================================================================
     # ADVANCED TRAINING FEATURES
     # ============================================================================
+    
+    # Logit masking for 3-class classification
+    USE_LOGIT_MASKING: bool = True
+    """Enable logit masking to only consider 3 answer tokens during training"""
     
     # Learning rate scheduling
     USE_LR_SCHEDULING: bool = True
@@ -189,8 +236,15 @@ class Config:
     LR_WARMUP_RATIO: float = 0.1
     """Fraction of total steps for learning rate warmup"""
     
-    LR_MIN_RATIO: float = 0.1
+    LR_MIN_RATIO: float = 0.01
     """Minimum learning rate ratio (final LR = initial LR * min_ratio)"""
+    
+    # Cosine annealing specific
+    LR_COSINE_RESTART: bool = False
+    """Enable cosine annealing with restarts"""
+    
+    LR_COSINE_RESTART_PERIOD: int = 1000
+    """Period for cosine annealing restarts (in steps)"""
     
     # Dynamic consistency weighting
     USE_DYNAMIC_CONSISTENCY: bool = True
@@ -244,9 +298,6 @@ class Config:
     # Memory optimization
     GRADIENT_CHECKPOINTING: bool = True
     """Enable gradient checkpointing to reduce memory usage"""
-    
-    DATALOADER_PREFETCH_FACTOR: int = 4
-    """Number of batches to prefetch per worker"""
     
     # Memory management configuration
     ENABLE_MEMORY_CLEANUP: bool = True

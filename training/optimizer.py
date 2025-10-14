@@ -45,7 +45,7 @@ def group_parameters_for_optimizer(model) -> List[Dict[str, Any]]:
             continue
         if "lora_" in n:
             lora_params.append(p)
-        elif "mm_projector" in n or "multi_modal_projector" in n:
+        elif "mm_projector" in n or "multi_modal_projector" in n or "projector" in n:
             proj_params.append(p)
 
     # Create parameter groups with appropriate learning rates
@@ -83,7 +83,7 @@ def create_optimizer(model, weight_decay: float = 0.01) -> AdamW:
 
 def create_scheduler(optimizer, total_steps: int, warmup_steps: int, schedule_type: str = "cosine"):
     """
-    Create learning rate scheduler.
+    Create learning rate scheduler with enhanced configuration.
     
     Args:
         optimizer: Optimizer to schedule
@@ -95,26 +95,26 @@ def create_scheduler(optimizer, total_steps: int, warmup_steps: int, schedule_ty
         Configured scheduler or None if scheduling is disabled
     """
     from configs.config import config
+    from .lr_scheduler import create_multi_lr_scheduler, print_lr_schedule_info
     
     if not getattr(config, 'USE_LR_SCHEDULING', False):
         return None
     
-    from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+    # Calculate warmup ratio
+    warmup_ratio = warmup_steps / total_steps if total_steps > 0 else 0.1
     
-    if schedule_type == "cosine":
-        return get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            num_cycles=0.5,
-            last_epoch=-1
-        )
-    elif schedule_type == "linear":
-        return get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-            last_epoch=-1
-        )
-    else:
-        return None
+    # Create enhanced scheduler
+    scheduler = create_multi_lr_scheduler(
+        optimizer=optimizer,
+        num_training_steps=total_steps,
+        lora_lr=config.LR_LORA,
+        projection_lr=config.LR_PROJECTION,
+        warmup_ratio=warmup_ratio,
+        schedule_type=schedule_type,
+        min_lr_ratio=config.LR_MIN_RATIO
+    )
+    
+    # Print schedule information
+    print_lr_schedule_info(scheduler, total_steps, warmup_ratio, schedule_type)
+    
+    return scheduler
