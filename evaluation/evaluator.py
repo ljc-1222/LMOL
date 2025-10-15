@@ -429,8 +429,8 @@ def evaluate_fold(fold_name: str, model, processor, eval_csv: Path, fold_path: P
         t2 = get_pixel(p2)
         # Match training dtype for consistency (training uses float32)
         # Ensure both tensors are on the same device before stacking
-        t1 = t1.to(device, dtype=torch.float32)
-        t2 = t2.to(device, dtype=torch.float32)
+        t1 = t1.to(device=device, dtype=torch.float32)
+        t2 = t2.to(device=device, dtype=torch.float32)
         pixel_pair = torch.stack([t1, t2], dim=0)
         pred_label = classify_pair(model, tokenizer, prompt_ids, prompt_attn, pixel_pair)
         y_true.append(pr.label)

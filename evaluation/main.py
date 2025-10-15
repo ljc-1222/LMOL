@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import List
 
 from configs.config import config
+# No custom device utilities needed - PyTorch handles everything automatically
 # Lazy imports to avoid dependency issues
 # from .evaluator import load_single_fold, evaluate_fold, free_model
 # from .metrics import plot_and_save_cm
@@ -50,7 +51,10 @@ def get_eval_csv_for_fold(fold_idx: int) -> Path:
 
 
 def evaluation_main():
-    """Main evaluation function."""
+    """Main evaluation function using PyTorch's default single-process handling."""
+    # Evaluation runs in single-process mode
+    print(f"[INFO] Running evaluation with PyTorch's default single-process handling")
+    
     # Lazy imports to avoid dependency issues
     from .evaluator import load_single_fold, evaluate_fold, free_model
     from .metrics import plot_and_save_cm

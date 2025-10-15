@@ -15,7 +15,6 @@ LMOL/
 ├── data/
 │   ├── __init__.py
 │   ├── dataset.py (SCUT_FBP5500_Pairs dataset)
-│   ├── collator.py (LlavaPairsCollator)
 │   ├── classification_collator.py (ClassificationCollator)
 │   ├── loader.py (image loading utilities)
 │   ├── processor.py (data processing utilities)
@@ -29,7 +28,6 @@ LMOL/
 ├── training/
 │   ├── __init__.py
 │   ├── classification_trainer.py (LMOLClassificationTrainer)
-│   ├── trainer.py (WeightedSwapConsistencyTrainer)
 │   ├── callbacks.py (training callbacks)
 │   ├── optimizer.py (optimizer setup)
 │   ├── lr_scheduler.py (learning rate scheduling)
@@ -145,7 +143,7 @@ Key parameters in `configs/config.py`:
 - `NUM_EPOCHS`: 3
 - `LR_LORA`: 5e-5 (LoRA learning rate)
 - `LR_PROJECTION`: 5e-4 (projector learning rate)
-- `USE_CLASSIFICATION_TRAINING`: True (recommended)
+- Classification-based training (only supported approach)
 
 ### Training Process
 
@@ -279,9 +277,9 @@ with torch.no_grad():
 ### Key Fixes Applied
 
 1. **Data Leakage Prevention**
-   - Fixed answer tokens in input sequence (generation-based trainer)
+   - Removed generation-based trainer with data leakage
    - Implemented proper classification approach
-   - Added ClassificationCollator for leak-free training
+   - Uses ClassificationCollator for leak-free training
 
 2. **Training Stability**
    - Fixed parameter grouping in optimizer

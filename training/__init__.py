@@ -3,23 +3,19 @@
 LMOL Training Module
 
 This module provides all training-related functionality for the LMOL project:
-- Custom trainer with swap consistency regularization
+- Classification trainer with swap consistency regularization
 - Training callbacks for model saving
 - Optimizer setup with dual learning rates
 - Main training orchestration
 
 Key Components:
-- trainer: WeightedSwapConsistencyTrainer implementation
+- classification_trainer: LMOLClassificationTrainer implementation
 - callbacks: Training callbacks for model saving and monitoring
 - optimizer: Optimizer setup with parameter grouping
 - main: Main training orchestration and fold management
 """
 
 # Lazy imports to avoid dependency issues
-def WeightedSwapConsistencyTrainer(*args, **kwargs):
-    """Lazy import of WeightedSwapConsistencyTrainer."""
-    from .trainer import WeightedSwapConsistencyTrainer as _WeightedSwapConsistencyTrainer
-    return _WeightedSwapConsistencyTrainer(*args, **kwargs)
 
 def LMOLClassificationTrainer(*args, **kwargs):
     """Lazy import of LMOLClassificationTrainer."""
@@ -47,7 +43,6 @@ def training_main(*args, **kwargs):
     return _training_main(*args, **kwargs)
 
 __all__ = [
-    "WeightedSwapConsistencyTrainer",
     "LMOLClassificationTrainer",
     "SaveBestTrainingLossCallback", 
     "group_parameters_for_optimizer",

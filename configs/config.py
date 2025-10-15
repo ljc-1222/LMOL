@@ -160,11 +160,11 @@ class Config:
     """Number of batches to prefetch per worker"""
     
     # Learning rate configuration
-    LR_LORA: float = 5e-5
-    """Learning rate for LoRA parameters (adapts pretrained weights)"""
+    LR_LORA: float = 1e-5
+    """Learning rate for LoRA parameters (reduced for stability)"""
     
-    LR_PROJECTION: float = 5e-4
-    """Learning rate for projector parameters (learns from scratch)"""
+    LR_PROJECTION: float = 1e-4
+    """Learning rate for projector parameters (reduced for stability)"""
     
     WEIGHT_DECAY: float = 0.1
     """Weight decay regularization coefficient"""
@@ -179,9 +179,7 @@ class Config:
     # TRAINING METHOD CONFIGURATION
     # ============================================================================
     
-    # Training approach selection
-    USE_CLASSIFICATION_TRAINING: bool = True
-    """Use classification-based training instead of generation-based training"""
+    # Note: Only classification-based training is supported (generation-based had data leakage)
     
     # ============================================================================
     # TRAINING HEALTH MONITORING
@@ -201,11 +199,11 @@ class Config:
     MONITOR_GRADIENT_NORMS: bool = True
     """Enable gradient norm monitoring and warnings"""
     
-    GRADIENT_NORM_THRESHOLD: float = 10.0
-    """Threshold for gradient norm warnings (explosion detection)"""
+    GRADIENT_NORM_THRESHOLD: float = 5.0
+    """Threshold for gradient norm warnings (reduced for earlier detection)"""
     
-    GRADIENT_NORM_MIN_THRESHOLD: float = 1e-6
-    """Minimum threshold for gradient norm warnings (vanishing detection)"""
+    GRADIENT_NORM_MIN_THRESHOLD: float = 1e-4
+    """Minimum threshold for gradient norm warnings (increased for better detection)"""
     
     # Per-class accuracy monitoring
     LOG_PER_CLASS_ACCURACY: bool = True
@@ -233,8 +231,8 @@ class Config:
     LR_SCHEDULE_TYPE: str = "cosine"
     """Type of learning rate schedule: 'cosine', 'linear', or 'constant'"""
     
-    LR_WARMUP_RATIO: float = 0.1
-    """Fraction of total steps for learning rate warmup"""
+    LR_WARMUP_RATIO: float = 0.05
+    """Fraction of total steps for learning rate warmup (reduced for gentler ramp-up)"""
     
     LR_MIN_RATIO: float = 0.01
     """Minimum learning rate ratio (final LR = initial LR * min_ratio)"""
@@ -250,11 +248,11 @@ class Config:
     USE_DYNAMIC_CONSISTENCY: bool = True
     """Enable dynamic consistency weight for improved training stability"""
     
-    CONS_WEIGHT_START: float = 20.0
-    """Starting consistency weight (lower for early training stability)"""
+    CONS_WEIGHT_START: float = 5.0
+    """Starting consistency weight (reduced for more conservative training)"""
     
-    CONS_WEIGHT_END: float = 50.0
-    """Final consistency weight (higher for stronger regularization)"""
+    CONS_WEIGHT_END: float = 20.0
+    """Final consistency weight (reduced for more stable training)"""
     
     CONS_WEIGHT_RAMP_RATIO: float = 0.5
     """Fraction of training steps to reach final consistency weight"""
@@ -270,6 +268,17 @@ class Config:
     """Forward pass strategy: 'double' for swap doubling, 'single' otherwise"""
     
     # ============================================================================
+    # MEMORY MANAGEMENT CONFIGURATION
+    # ============================================================================
+    
+    # GPU memory management
+    ENABLE_MEMORY_CLEANUP: bool = True
+    """Enable intelligent memory cleanup during training"""
+    
+    MEMORY_CLEANUP_FREQUENCY: int = 10
+    """How often to perform memory cleanup (every N batches)"""
+    
+    # ============================================================================
     # PERFORMANCE OPTIMIZATION CONFIGURATION
     # ============================================================================
     
@@ -283,7 +292,7 @@ class Config:
     """Flash Attention backend: 'flash_attn', 'sdpa', or 'eager'"""
     
     GRADIENT_CLIP_NORM: float = 1.0
-    """Gradient clipping threshold for training stability"""
+    """Gradient clipping threshold for training stability (1.0 is a good default for most cases)"""
     
     REMOVE_UNUSED_COLUMNS: bool = False
     """Keep all columns to avoid processing overhead"""

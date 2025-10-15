@@ -31,10 +31,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from configs.config import config
 from utils.constants import HEADER_SEPARATOR_LENGTH
 from utils import set_seed
-from data import SCUT_FBP5500_Pairs, LlavaPairsCollator
+from utils.csv_logger import create_training_logger, CSVTrainLogger
+# No custom device utilities needed - PyTorch handles everything automatically
+from data import SCUT_FBP5500_Pairs, ClassificationCollator
 from model import model_generator
 # Lazy imports to avoid dependency issues
-# from .trainer import WeightedSwapConsistencyTrainer
 # from .callbacks import SaveBestTrainingLossCallback
 # from .optimizer import group_parameters_for_optimizer, create_optimizer, create_scheduler
 
@@ -138,7 +139,7 @@ def first_batch_sanity_check(trainer):
 
 def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     """
-    Train LMOL model for a single fold.
+    Train LMOL model for a single fold using PyTorch's default single-process handling.
     
     This function implements the complete training pipeline for one fold:
     1. Set up reproducible random seeds
@@ -149,11 +150,21 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     6. Train with weighted cross-entropy + consistency loss
     7. Save final model and training metadata
     
+    The training uses PyTorch's implicit single-process handling which can
+    automatically utilize available GPUs if configured by the framework.
+    
     Args:
         fold_idx: Fold index (1-based)
         train_csv: Path to training CSV file
         out_dir: Output directory for this fold
     """
+    # PyTorch will automatically handle device selection
+    print(f"[INFO] Using PyTorch's default device handling (CUDA available: {torch.cuda.is_available()})")
+    if torch.cuda.is_available():
+        print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"[INFO] GPU {i}: {torch.cuda.get_device_name(i)}")
+    
     # Suppress warnings during training
     import warnings
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -161,14 +172,13 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     warnings.filterwarnings("ignore", message=".*loss_type=None.*was set in the config but it is unrecognised.*")
     
     # Lazy imports to avoid dependency issues
-    from .trainer import WeightedSwapConsistencyTrainer
-    from .classification_trainer import LMOLClassificationTrainer
-    from .callbacks import SaveBestTrainingLossCallback
-    from .optimizer import group_parameters_for_optimizer, create_optimizer, create_scheduler
+    from training.classification_trainer import LMOLClassificationTrainer
+    from training.callbacks import SaveBestTrainingLossCallback
+    from training.optimizer import group_parameters_for_optimizer, create_optimizer, create_scheduler
     
     _print_header(f"Fold {fold_idx} Training")
     
-    # Set reproducible seed for this fold
+    # Set reproducible seed for this fold (same seed across all processes)
     seed = 42 + fold_idx
     set_seed(seed)
     
@@ -176,6 +186,9 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     ds = SCUT_FBP5500_Pairs(str(train_csv))
     model, processor, tokenizer, fast_processor = model_generator()
     model.train()
+    
+    # PyTorch will automatically handle device placement
+    print(f"[INFO] Model will be automatically placed on available device")
 
     # Calculate training parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -183,7 +196,10 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     
     # Account for swap doubling: 45,000 pairs → 90,000 samples
     effective_samples = len(ds) * 2 if config.SWAP_DOUBLE else len(ds)
+    
+    # Calculate effective batch size (no DDP scaling)
     effective_batch_size = config.PER_DEVICE_TRAIN_BATCH_SIZE * config.GRADIENT_ACCUMULATION_STEPS * 2
+    
     steps_per_epoch = math.ceil(effective_samples / effective_batch_size)
     total_steps = steps_per_epoch * config.NUM_EPOCHS
     warmup_steps = int(math.ceil(total_steps * config.LR_WARMUP_RATIO))
@@ -247,23 +263,21 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     # Format schedule information with LR scheduler type
     schedule_type = config.LR_SCHEDULE_TYPE if getattr(config, 'USE_LR_SCHEDULING', False) else "constant"
     print(f"  Schedule:  {config.NUM_EPOCHS} epoch × {batches_per_epoch:,} batches = {batches_per_epoch * config.NUM_EPOCHS:,} total batches. Warmup is {warmup_steps:,} batches ({config.LR_WARMUP_RATIO:.4%}), and the LR schedule is `{schedule_type}`")
+    
+    # DataLoader workers configuration
+    print(f"  WORKERS:   {config.DATALOADER_NUM_WORKERS}")
+    
     print(f"  Speedup:   Workers = {config.DATALOADER_NUM_WORKERS}, PinMem = {config.DATALOADER_PIN_MEMORY}, " +
           f"FastProc = {fast_processor}, Compile = {getattr(config, 'USE_TORCH_COMPILE', False)}, " +
           f"FlashAttn = {getattr(config, 'USE_FLASH_ATTENTION', False)}")
     print(f"  Seed:      {seed}")
     print()
 
-    # Create data collator based on training method
-    if config.USE_CLASSIFICATION_TRAINING:
-        from data.classification_collator import ClassificationCollator
-        collator = ClassificationCollator(processor, tokenizer, max_length=config.MAX_SEQ_LEN, is_training=True)
-        print(f"[TRAINING] Using classification-based training approach")
-    else:
-        collator = LlavaPairsCollator(processor=processor, tokenizer=tokenizer,
-                                      max_length=config.MAX_SEQ_LEN, is_training=True)
-        print(f"[TRAINING] Using generation-based training approach")
+    # Create data collator (classification approach only)
+    collator = ClassificationCollator(processor, tokenizer, max_length=config.MAX_SEQ_LEN, is_training=True)
+    print(f"[TRAINING] Using classification-based training approach")
 
-    # Configure training arguments with performance optimizations
+    # Configure training arguments
     args = TrainingArguments(
         output_dir=str(out_dir),
         per_device_train_batch_size=config.PER_DEVICE_TRAIN_BATCH_SIZE,
@@ -284,7 +298,7 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
         gradient_checkpointing=config.GRADIENT_CHECKPOINTING,
         remove_unused_columns=config.REMOVE_UNUSED_COLUMNS,
         logging_first_step=False,  # Disable first step logging to use custom format
-        disable_tqdm=False,  # Keep progress bars
+        disable_tqdm=False,  # Show progress bar
         max_grad_norm=config.GRADIENT_CLIP_NORM,
         warmup_steps=warmup_steps,
         max_steps=total_steps,
@@ -299,48 +313,37 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     # Configure learning rate scheduler
     scheduler = create_scheduler(optimizer, total_steps, warmup_steps, config.LR_SCHEDULE_TYPE)
 
-    # Initialize trainer based on training method
-    if config.USE_CLASSIFICATION_TRAINING:
-        # Use classification-based trainer
-        trainer = LMOLClassificationTrainer(
-            model=model,
-            args=args,
-            data_collator=collator,
-            train_dataset=ds,
-            tokenizer=tokenizer,
-            w_sim=config.WSIM,
-            cons_weight=config.CONS_WEIGHT,
-            swap_ce_weight=getattr(config, 'SWAP_CE_WEIGHT', 1.0),
-            optimizers=(optimizer, scheduler),
-            use_dynamic_consistency=getattr(config, 'USE_DYNAMIC_CONSISTENCY', False),
-            cons_weight_start=getattr(config, 'CONS_WEIGHT_START', 5.0),
-            cons_weight_end=getattr(config, 'CONS_WEIGHT_END', 20.0),
-            cons_weight_ramp_ratio=getattr(config, 'CONS_WEIGHT_RAMP_RATIO', 0.5),
-            total_steps=total_steps,
-        )
-    else:
-        # Use generation-based trainer
-        trainer = WeightedSwapConsistencyTrainer(
-            model=model,
-            args=args,
-            data_collator=collator,
-            train_dataset=ds,
-            tokenizer=tokenizer,
-            w_sim=config.WSIM,
-            cons_weight=config.CONS_WEIGHT,
-            swap_ce_weight=getattr(config, 'SWAP_CE_WEIGHT', 1.0),
-            optimizers=(optimizer, scheduler),
-            use_dynamic_consistency=getattr(config, 'USE_DYNAMIC_CONSISTENCY', False),
-            cons_weight_start=getattr(config, 'CONS_WEIGHT_START', 5.0),
-            cons_weight_end=getattr(config, 'CONS_WEIGHT_END', 20.0),
-            cons_weight_ramp_ratio=getattr(config, 'CONS_WEIGHT_RAMP_RATIO', 0.5),
-            total_steps=total_steps,
-        )
+    # Initialize classification trainer
+    trainer = LMOLClassificationTrainer(
+        model=model,
+        args=args,
+        data_collator=collator,
+        train_dataset=ds,
+        tokenizer=tokenizer,
+        w_sim=config.WSIM,
+        cons_weight=config.CONS_WEIGHT,
+        swap_ce_weight=getattr(config, 'SWAP_CE_WEIGHT', 1.0),
+        optimizers=(optimizer, scheduler),
+        use_dynamic_consistency=getattr(config, 'USE_DYNAMIC_CONSISTENCY', False),
+        cons_weight_start=getattr(config, 'CONS_WEIGHT_START', 5.0),
+        cons_weight_end=getattr(config, 'CONS_WEIGHT_END', 20.0),
+        cons_weight_ramp_ratio=getattr(config, 'CONS_WEIGHT_RAMP_RATIO', 0.5),
+        total_steps=total_steps,
+    )
+    
 
-    # Add callback for automatic model saving
+    # DataLoader will use default RandomSampler
+    print(f"[DATA] Using default RandomSampler for dataset with {len(ds)} samples")
+
+    # Create CSV logger for training metrics
+    # out_dir already contains the fold directory, so we pass it directly
+    csv_logger = CSVTrainLogger(out_dir, "training_log.csv")
+    print(f"[CSV_LOG] Training metrics will be logged to: {csv_logger.get_log_path()}")
+    
+    # Add callback for automatic model saving and CSV logging
     best_dir = out_dir / "best"
     last_dir = out_dir / "last"
-    trainer.add_callback(SaveBestTrainingLossCallback(best_dir, processor, tokenizer))
+    trainer.add_callback(SaveBestTrainingLossCallback(best_dir, processor, tokenizer, csv_logger))
 
     # Perform sanity check on first batch
     first_batch_sanity_check(trainer)
@@ -348,9 +351,11 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     # Start training
     print("Training started...")
     print("-" * 72)
+    
     t0 = time.time()
     trainer.train()
     t1 = time.time()
+    
     print("-" * 72)
 
     # Save final model and metadata
@@ -395,14 +400,20 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
         "cons_weight": float(config.CONS_WEIGHT),
         "wsim": float(config.WSIM),
         "seed": seed,
+        "cuda_available": torch.cuda.is_available(),
+        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
     }, indent=2), encoding="utf-8")
 
     print(f"\n[INFO] Fold {fold_idx} complete: {(t1-t0)/60:.4f} min | Saved to: {out_dir.name}\n")
+    
+    # Clean up GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def training_main():
     """
-    Main training function for LMOL.
+    Main training function for LMOL using PyTorch's default single-process handling.
     
     Orchestrates the complete training pipeline:
     1. Create timestamped output directory
@@ -414,7 +425,17 @@ def training_main():
     The training implements 5-fold cross-validation where each fold
     trains a separate model adapter on 4/5 of the data and evaluates
     on the remaining 1/5.
+    
+    Uses PyTorch's implicit single-process handling which can automatically
+    utilize available GPUs if configured by the framework.
     """
+    # PyTorch will automatically handle device selection
+    print(f"[INFO] Using PyTorch's default device handling (CUDA available: {torch.cuda.is_available()})")
+    if torch.cuda.is_available():
+        print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"[INFO] GPU {i}: {torch.cuda.get_device_name(i)}")
+    
     # Create timestamped output directory
     run_dir = resolve_path(getattr(config, "OUTPUT_DIR", "outputs")) / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -428,20 +449,21 @@ def training_main():
     for i, csv in enumerate(csvs, 1):
         fold_dir = run_dir / f"fold{i}"
         fold_dir.mkdir(parents=True, exist_ok=True)
+        
         train_one_fold(i, csv, fold_dir)
         
         # Clean up GPU memory between folds
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
-        # Additional memory cleanup using memory manager
-        from utils.memory_manager import cleanup_model_memory
-        # Note: trainer variable is not accessible here, so we rely on the trainer's own cleanup
     
     # Final summary
     _print_header("All Folds Complete")
     print(f"[INFO] Trained {len(csvs)} fold(s) successfully")
-    print(f"[INFO] Output directory: {run_dir}\n")
+    print(f"[INFO] Output directory: {run_dir}")
+    print(f"[INFO] CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[INFO] GPU count: {torch.cuda.device_count()}")
+    print()
 
 
 if __name__ == "__main__":

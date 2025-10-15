@@ -29,6 +29,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from configs.config import config
 from utils.constants import IGNORE_INDEX
 from utils.memory_manager import MemoryManager, get_memory_manager
+# No custom device utilities needed - PyTorch handles everything automatically
 from .health_monitor import HealthMonitoringCallback
 
 
@@ -165,11 +166,11 @@ class LMOLClassificationTrainer(Trainer):
             last_token_logits[:, similar_token_id]  # Similar
         ], dim=1)  # [batch_size, 3]
         
-        # Debug information (only print once to avoid spam)
+        # Debug information (only print once to avoid spam) - MUTED
         if not hasattr(self, '_debug_printed'):
-            print(f"[INFO] Classification logits shape: {classification_logits.shape}")
-            print(f"[INFO] Label IDs shape: {label_ids.shape}")
-            print(f"[INFO] First token ID: {first_token_id}, Second token ID: {second_token_id}, Similar token ID: {similar_token_id}")
+            # print(f"[INFO] Classification logits shape: {classification_logits.shape}")
+            # print(f"[INFO] Label IDs shape: {label_ids.shape}")
+            # print(f"[INFO] First token ID: {first_token_id}, Second token ID: {second_token_id}, Similar token ID: {similar_token_id}")
             self._debug_printed = True
         
         # Create class weights
@@ -296,18 +297,13 @@ class LMOLClassificationTrainer(Trainer):
         self._last_total = float(loss.detach().cpu().item())
         
         # Log metrics with explicit loss breakdown for debugging
+        # Call our custom log method to ensure batch accuracy logging is displayed
         log_dict = {
             "loss": self._last_total,
             "ce_loss": self._last_ce,
             "cons_loss": self._last_cons,
             "grad_norm": self._last_grad_norm,
             "train_acc": self._last_train_acc,
-            "train_acc_first": self._last_class_acc.get('first', 0.0),
-            "train_acc_second": self._last_class_acc.get('second', 0.0),
-            "train_acc_similar": self._last_class_acc.get('similar', 0.0),
-            "loss_update": self._last_total,  # Explicit: this is the loss used for optimizer step
-            "weighted_ce": self._last_ce,     # Explicit: cross-entropy component
-            "consistency_loss": self._last_cons,  # Explicit: consistency component
         }
         
         self.log(log_dict)
@@ -324,7 +320,7 @@ class LMOLClassificationTrainer(Trainer):
         return current_weight
     
     def log(self, logs: Dict[str, float], step: Optional[int] = None) -> None:
-        """Custom logging method for clean, minimal training output."""
+        """Custom logging method for clean, minimal training output with DDP support."""
         if step is None:
             step = getattr(self.state, 'global_step', 0)
         
@@ -386,17 +382,18 @@ class LMOLClassificationTrainer(Trainer):
             epoch_progress = 0.0
         
         # Enhanced logging with per-class accuracy
-        if hasattr(self, '_last_class_acc') and self._last_class_acc:
-            class_acc_str = f" | Class Acc: F={self._last_class_acc.get('first', 0.0):.3f}, S={self._last_class_acc.get('second', 0.0):.3f}, Sim={self._last_class_acc.get('similar', 0.0):.3f}"
-        else:
-            class_acc_str = ""
+        if True:  # Always print in single-process mode
+            if hasattr(self, '_last_class_acc') and self._last_class_acc:
+                class_acc_str = f" | Class Acc: F={self._last_class_acc.get('first', 0.0):.3f}, S={self._last_class_acc.get('second', 0.0):.3f}, Sim={self._last_class_acc.get('similar', 0.0):.3f}"
+            else:
+                class_acc_str = ""
+            
+            print(f"Batch {effective_batch_num:4d} | Epoch {epoch_progress:.5f} | "
+                  f"Loss: {avg_loss:.3e} (CE: {avg_ce_loss:.3e}, Cons: {avg_cons_loss:.3e}) | "
+                  f"Acc: {train_acc:.4f}{class_acc_str} | "
+                  f"LR: Proj = {lr_proj:.2e}, LoRA = {lr_lora:.2e} | Grad: {avg_grad_norm:.2e}")
         
-        print(f"Batch {effective_batch_num:4d} | Epoch {epoch_progress:.5f} | "
-              f"Loss: {avg_loss:.3e} (CE: {avg_ce_loss:.3e}, Cons: {avg_cons_loss:.3e}) | "
-              f"Acc: {train_acc:.4f}{class_acc_str} | "
-              f"LR: Proj = {lr_proj:.2e}, LoRA = {lr_lora:.2e} | Grad: {avg_grad_norm:.2e}")
-        
-        # Prepare callback logs
+        # Prepare callback logs with all available metrics
         callback_logs = {
             'loss': avg_loss,
             'ce_loss': avg_ce_loss,
@@ -404,6 +401,12 @@ class LMOLClassificationTrainer(Trainer):
             'grad_norm': avg_grad_norm,
             'epoch': epoch_progress,
             'learning_rate': lr_lora,
+            'lr_projection': lr_proj,
+            'lr_lora': lr_lora,
+            'train_acc': train_acc,
+            'train_acc_first': self._last_class_acc.get('first', 0.0) if hasattr(self, '_last_class_acc') else 0.0,
+            'train_acc_second': self._last_class_acc.get('second', 0.0) if hasattr(self, '_last_class_acc') else 0.0,
+            'train_acc_similar': self._last_class_acc.get('similar', 0.0) if hasattr(self, '_last_class_acc') else 0.0,
             'step': effective_batch_num,
         }
         
@@ -411,7 +414,38 @@ class LMOLClassificationTrainer(Trainer):
         if hasattr(self, 'state'):
             self.state.log_history.append(callback_logs)
         
+        # Call callback handler
         if hasattr(self, 'control') and hasattr(self, 'callback_handler'):
-            self.control = self.callback_handler.on_log(
-                self.args, self.state, self.control, callback_logs
-            )
+            # Capture stdout to suppress unwanted prints, but save our callback prints
+            import sys
+            import io
+            
+            # Create a custom stdout that only suppresses dictionary-like output
+            class FilteredStdout:
+                def __init__(self, original_stdout):
+                    self.original_stdout = original_stdout
+                    self.buffer = ""
+                
+                def write(self, text):
+                    # If it looks like a dictionary with our keys, suppress it
+                    if ('{' in text and 'loss' in text and 'ce_loss' in text and 
+                        'cons_loss' in text and 'grad_norm' in text):
+                        # Skip this output - it's the unwanted dict print
+                        return
+                    else:
+                        # Allow other output (like our callback notifications)
+                        self.original_stdout.write(text)
+                
+                def flush(self):
+                    self.original_stdout.flush()
+            
+            # Temporarily replace stdout
+            old_stdout = sys.stdout
+            sys.stdout = FilteredStdout(old_stdout)
+            try:
+                self.control = self.callback_handler.on_log(
+                    self.args, self.state, self.control, callback_logs
+                )
+            finally:
+                # Restore original stdout
+                sys.stdout = old_stdout

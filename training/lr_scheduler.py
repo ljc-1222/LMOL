@@ -235,18 +235,19 @@ def print_lr_schedule_info(
     """
     num_warmup_steps = int(num_training_steps * warmup_ratio)
     
-    print(f"\n[LR_SCHEDULE] Learning Rate Schedule Configuration:")
-    print(f"  Schedule Type: {schedule_type}")
-    print(f"  Total Steps: {num_training_steps}")
-    print(f"  Warmup Steps: {num_warmup_steps} ({warmup_ratio:.1%})")
-    print(f"  Training Steps: {num_training_steps - num_warmup_steps}")
+    # MUTED: Learning rate schedule info to reduce console output
+    # print(f"\n[LR_SCHEDULE] Learning Rate Schedule Configuration:")
+    # print(f"  Schedule Type: {schedule_type}")
+    # print(f"  Total Steps: {num_training_steps}")
+    # print(f"  Warmup Steps: {num_warmup_steps} ({warmup_ratio:.1%})")
+    # print(f"  Training Steps: {num_training_steps - num_warmup_steps}")
     
-    # Show LR at key points
-    key_steps = [0, num_warmup_steps, num_training_steps // 2, num_training_steps - 1]
-    print(f"  Learning Rate Schedule:")
-    for step in key_steps:
-        if step < num_training_steps:
-            lr_multiplier = scheduler.lr_lambdas[0](step) if hasattr(scheduler, 'lr_lambdas') else 1.0
-            print(f"    Step {step:4d}: LR multiplier = {lr_multiplier:.6f}")
+    # # Show LR at key points
+    # key_steps = [0, num_warmup_steps, num_training_steps // 2, num_training_steps - 1]
+    # print(f"  Learning Rate Schedule:")
+    # for step in key_steps:
+    #     if step < num_training_steps:
+    #         lr_multiplier = scheduler.lr_lambdas[0](step) if hasattr(scheduler, 'lr_lambdas') else 1.0
+    #         print(f"    Step {step:4d}: LR multiplier = {lr_multiplier:.6f}")
     
-    print()
+    # print()

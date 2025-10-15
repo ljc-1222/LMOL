@@ -18,14 +18,14 @@ Key Components:
 """
 
 from .dataset import SCUT_FBP5500_Pairs, PairSample
-from .collator import LlavaPairsCollator
+from .classification_collator import ClassificationCollator
 from .loader import basic_image_loader
 from .processor import PairRecord, read_pairs_csv, write_pairs_csv, label_from_scores
 
 __all__ = [
     "SCUT_FBP5500_Pairs",
     "PairSample", 
-    "LlavaPairsCollator",
+    "ClassificationCollator",
     "basic_image_loader",
     "PairRecord",
     "read_pairs_csv",

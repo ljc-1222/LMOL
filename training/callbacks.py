@@ -16,12 +16,15 @@ Key Features:
 import json
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import torch
 from transformers import TrainerCallback
+
+from utils.csv_logger import CSVTrainLogger
 
 
 class SaveBestTrainingLossCallback(TrainerCallback):
@@ -37,7 +40,7 @@ class SaveBestTrainingLossCallback(TrainerCallback):
     - Comprehensive metadata tracking
     - Robust error handling for save operations
     """
-    def __init__(self, best_dir: Path, processor, tokenizer):
+    def __init__(self, best_dir: Path, processor, tokenizer, csv_logger: Optional[CSVTrainLogger] = None):
         """
         Initialize the callback.
         
@@ -45,6 +48,7 @@ class SaveBestTrainingLossCallback(TrainerCallback):
             best_dir: Directory to save best model
             processor: Image processor for saving
             tokenizer: Tokenizer for saving
+            csv_logger: Optional CSV logger for training metrics
         """
         self.best_dir = best_dir
         self.last_dir = best_dir.parent / "last"
@@ -53,6 +57,8 @@ class SaveBestTrainingLossCallback(TrainerCallback):
         self._processor = processor
         self._tokenizer = tokenizer
         self._first_model_saved = False
+        self.csv_logger = csv_logger
+        self._last_log_time = time.time()
 
     def _notify(self, title: str, message: str) -> None:
         """
@@ -72,12 +78,14 @@ class SaveBestTrainingLossCallback(TrainerCallback):
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         """
-        Handle training log events for model saving.
+        Handle training log events for model saving and CSV logging.
         
         Monitors training loss and saves models when:
         - First model (best model) - always save the first model
         - Loss improves (best model) - any improvement counts
         - At the end of each epoch (last model)
+        
+        Also logs training metrics to CSV if csv_logger is provided.
         
         Args:
             args: Training arguments
@@ -96,12 +104,57 @@ class SaveBestTrainingLossCallback(TrainerCallback):
         
         if not is_main:
             return
+        
+        # Calculate batch time for performance monitoring
+        current_time = time.time()
+        batch_time_ms = (current_time - self._last_log_time) * 1000
+        self._last_log_time = current_time
+        
+        # Get memory usage if available
+        memory_usage_mb = 0.0
+        if torch.cuda.is_available():
+            try:
+                memory_usage_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+            except Exception:
+                pass
+        
+        # Use the epoch from logs if available (float progress), otherwise fallback to state.epoch
+        current_epoch = logs.get('epoch', state.epoch) if logs else (state.epoch if state.epoch is not None else 0)
+        
+        # Log to CSV if logger is available
+        if self.csv_logger is not None:
+            # Prepare metrics for CSV logging
+            csv_metrics = {
+                'loss': logs.get('loss'),
+                'ce_loss': logs.get('ce_loss'),
+                'cons_loss': logs.get('cons_loss'),
+                'cons_weight': logs.get('cons_weight'),
+                'base_ce': logs.get('base_ce'),
+                'ce_weight': logs.get('ce_weight'),
+                'grad_norm': logs.get('grad_norm'),
+                'learning_rate': logs.get('learning_rate'),
+                'lr_projection': logs.get('lr_projection'),
+                'lr_lora': logs.get('lr_lora'),
+                'train_acc': logs.get('train_acc'),
+                'train_acc_first': logs.get('train_acc_first'),
+                'train_acc_second': logs.get('train_acc_second'),
+                'train_acc_similar': logs.get('train_acc_similar'),
+                'ce_ratio': logs.get('ce_ratio'),
+                'ema_ce_ratio': logs.get('ema_ce_ratio'),
+                'memory_usage_mb': memory_usage_mb,
+                'batch_time_ms': batch_time_ms
+            }
+            
+            # Log to CSV
+            self.csv_logger.log_metrics(
+                csv_metrics,
+                step=state.global_step,
+                epoch=current_epoch
+            )
             
         # Check for best model after each batch
         if state.global_step > 0:
             batch_num = state.global_step
-            # Use the epoch from logs if available (float progress), otherwise fallback to state.epoch
-            current_epoch = logs.get('epoch', state.epoch) if logs else (state.epoch if state.epoch is not None else 0)
             
             # Save first model as best model (even if it's not the best)
             if not self._first_model_saved:
