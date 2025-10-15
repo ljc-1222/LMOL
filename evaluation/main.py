@@ -116,10 +116,19 @@ def evaluation_main():
         del processor
         free_model(model)
         
-        # 繪製並儲存此 fold 的 confusion matrix（儲存在 fold 目錄）
+        # 繪製並儲存此 fold 的 confusion matrix（儲存在選定的模型目錄）
         try:
-            out_cm = fold_path / "confusion_matrix.png"
-            plot_and_save_cm(y_true, y_pred, out_cm, title=f"{fold_path.name} Confusion Matrix")
+            # Determine the model folder based on model_type
+            if args.model_type in ("best", "last"):
+                model_folder = fold_path / args.model_type
+            else:  # "fold" - use fold directory directly
+                model_folder = fold_path
+            
+            # Ensure the model folder exists
+            model_folder.mkdir(parents=True, exist_ok=True)
+            
+            out_cm = model_folder / "confusion_matrix.png"
+            plot_and_save_cm(y_true, y_pred, out_cm, title=f"{fold_path.name} ({args.model_type}) Confusion Matrix")
             print(f"[Plot] Saved confusion matrix to {out_cm}")
         except Exception as e:
             print(f"[Warn] Failed to plot/save confusion matrix for {fold_path.name}: {e}")
