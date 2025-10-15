@@ -238,20 +238,6 @@ data/processed/
 processed_data/
 datasets/processed/
 
-# Specific data files
-data/pairs/
-*.csv
-*.tsv
-*.json
-*.jsonl
-*.parquet
-*.feather
-*.arrow
-*.h5
-*.hdf5
-*.xlsx
-*.xls
-
 # Large data files
 *.zip
 *.tar.gz
