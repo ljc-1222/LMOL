@@ -332,20 +332,5 @@ Thumbs.db
 *.log
 logs/
 
-# =============================================================================
-# PROJECT SPECIFIC EXCLUSIONS
-# =============================================================================
-
-# Training data files (based on your project structure)
-data/interval_sample*.csv
-data/pairs/train_fold*.csv
-data/pairs/eval_fold*.csv
-
-# Raw dataset directory
-data/raw/SCUT-FBP5500/
-
-# Flash attention build files
-dependencies/flash-attention/build/
-dependencies/flash-attention/flash_attn_*.so
 
 
