@@ -29,7 +29,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from configs.config import config
 from utils.constants import IGNORE_INDEX
 from utils.memory_manager import MemoryManager, get_memory_manager
-# No custom device utilities needed - PyTorch handles everything automatically
+from utils.gpu_diag import GPUDeviceManager, get_canonical_device
+from utils.grad_diag import setup_gradient_diagnostics, assert_all_requires_grad
 from .health_monitor import HealthMonitoringCallback
 
 
@@ -117,17 +118,63 @@ class LMOLClassificationTrainer(Trainer):
         else:
             self.memory_manager = None
         
+        # Initialize GPU device manager for monitoring
+        self.device_manager = GPUDeviceManager(target_device=0)
+        self.device = self.device_manager.get_device()
+        self.gpu_log_interval = getattr(config, 'GPU_LOG_INTERVAL', 100)
+        
         # No classification head needed - use first token logits directly
         
         # Add health monitoring callback
         if config.MONITOR_GRADIENT_NORMS or config.MONITOR_LOSS_ANOMALIES or config.LOG_PER_CLASS_ACCURACY:
             self.add_callback(HealthMonitoringCallback())
+        
+        # Initialize gradient diagnostics
+        self.grad_diagnostics = None
+        self.amp_scaler = None
+        self.amp_dtype = getattr(config, 'AMP_DTYPE', 'bf16')
+        
+        # Set up AMP scaler for fp16
+        if self.amp_dtype == 'fp16' and torch.cuda.is_available():
+            self.amp_scaler = torch.cuda.amp.GradScaler()
+            print(f"[INFO] Initialized AMP scaler for fp16")
+        elif self.amp_dtype == 'bf16':
+            print(f"[INFO] Using bf16 AMP (no scaler needed)")
+        
+        # Set up gradient diagnostics
+        grad_log_interval = getattr(config, 'GRAD_LOG_INTERVAL', 10)
+        clip_grad_norm = getattr(config, 'GRADIENT_CLIP_NORM', 0.0)
+        detect_anomaly = getattr(config, 'DETECT_ANOMALY', False)
+        
+        if hasattr(self, 'model') and self.model is not None:
+            self.grad_diagnostics = setup_gradient_diagnostics(
+                model=self.model,
+                log_interval=grad_log_interval,
+                clip_grad_norm=clip_grad_norm,
+                detect_anomaly=detect_anomaly
+            )
+            print(f"[INFO] Initialized gradient diagnostics")
     
     
     @property
     def tokenizer(self):
         """Get the tokenizer from processing class."""
         return self.processing_class
+    
+    def setup_gradient_diagnostics(self):
+        """Set up gradient diagnostics after model is available."""
+        if self.grad_diagnostics is None and hasattr(self, 'model') and self.model is not None:
+            grad_log_interval = getattr(config, 'GRAD_LOG_INTERVAL', 10)
+            clip_grad_norm = getattr(config, 'GRADIENT_CLIP_NORM', 0.0)
+            detect_anomaly = getattr(config, 'DETECT_ANOMALY', False)
+            
+            self.grad_diagnostics = setup_gradient_diagnostics(
+                model=self.model,
+                log_interval=grad_log_interval,
+                clip_grad_norm=clip_grad_norm,
+                detect_anomaly=detect_anomaly
+            )
+            print(f"[INFO] Set up gradient diagnostics")
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -142,12 +189,45 @@ class LMOLClassificationTrainer(Trainer):
         Returns:
             Loss tensor (and optionally model outputs)
         """
+        # Set up gradient diagnostics if not already done
+        self.setup_gradient_diagnostics()
+        
+        # Verify device placement on first batch
+        if not hasattr(self, '_device_verified'):
+            try:
+                self.device_manager.verify_training_setup(model, inputs)
+                self._device_verified = True
+                print(f"[INFO] Training setup verified: model and batch on {self.device}")
+            except RuntimeError as e:
+                print(f"[ERROR] Training setup verification failed: {e}")
+                raise
+        
+        # GPU monitoring
+        current_step = getattr(self.state, 'global_step', 0)
+        if (self.gpu_log_interval > 0 and 
+            current_step > 0 and 
+            current_step % self.gpu_log_interval == 0 and 
+            self.device.type == "cuda"):
+            self.device_manager.log_memory_usage(current_step, "GPU")
+        
         label_ids: Optional[torch.Tensor] = inputs.pop("label_ids", None)
         pair_ids: Optional[torch.Tensor] = inputs.pop("pair_ids", None)
         
-        # Get model outputs (disable built-in loss computation)
+        # Ensure model is in training mode
+        model.train()
+        
+        # Get model outputs with proper AMP handling
         inputs_without_labels = {k: v for k, v in inputs.items() if k != 'labels'}
-        outputs = model(**inputs_without_labels)
+        
+        # Use autocast for mixed precision if enabled
+        if self.amp_dtype == 'bf16' and torch.cuda.is_available():
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**inputs_without_labels)
+        elif self.amp_dtype == 'fp16' and torch.cuda.is_available():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(**inputs_without_labels)
+        else:
+            outputs = model(**inputs_without_labels)
         
         # Use last token logits for classification (where model should predict answer)
         logits = outputs.logits  # [batch_size, seq_len, vocab_size]
@@ -191,7 +271,20 @@ class LMOLClassificationTrainer(Trainer):
                 
                 sample_weights[swap_mask] = self.swap_ce_weight
         
-        # Compute cross-entropy loss
+        # Validate inputs for loss computation
+        if not torch.isfinite(classification_logits).all():
+            raise ValueError("Classification logits contain NaN/Inf values")
+        
+        if not torch.all((label_ids >= 0) & (label_ids < 3)):
+            raise ValueError(f"Invalid label_ids: {label_ids.tolist()}. Must be in range [0, 2]")
+        
+        if not torch.isfinite(class_weights).all():
+            raise ValueError("Class weights contain NaN/Inf values")
+        
+        if not torch.isfinite(sample_weights).all():
+            raise ValueError("Sample weights contain NaN/Inf values")
+        
+        # Compute cross-entropy loss with numerical stability
         ce_loss_per_sample = torch.nn.functional.cross_entropy(
             classification_logits,  # [batch_size, 3]
             label_ids,              # [batch_size,] with values 0, 1, or 2
@@ -199,12 +292,26 @@ class LMOLClassificationTrainer(Trainer):
             reduction='none'        # Get per-sample loss
         )
         
+        # Validate loss computation
+        if not torch.isfinite(ce_loss_per_sample).all():
+            raise ValueError("Cross-entropy loss contains NaN/Inf values")
+        
         # Apply sample weights
         ce_loss = (ce_loss_per_sample * sample_weights).mean()
         
-        # Store for logging
-        self._last_ce = float(ce_loss.item())
-        self._last_weight = float(sample_weights.mean().item())
+        # Final loss validation
+        if not torch.isfinite(ce_loss):
+            raise ValueError(f"Final CE loss is not finite: {ce_loss.item()}")
+        
+        if ce_loss.item() < 0:
+            raise ValueError(f"Negative CE loss detected: {ce_loss.item()}")
+        
+        if ce_loss.item() > 100:  # Arbitrary large threshold
+            print(f"[WARNING] Very large CE loss: {ce_loss.item():.2f}")
+        
+        # Store for logging (detach only for logging, not for loss computation)
+        self._last_ce = float(ce_loss.detach().item())
+        self._last_weight = float(sample_weights.mean().detach().item())
         
         # Compute training accuracy (now meaningful!)
         with torch.no_grad():
@@ -260,41 +367,65 @@ class LMOLClassificationTrainer(Trainer):
                     perm_indices = torch.tensor([1, 0, 2], device=probs.device)
                     q_perm = q.index_select(-1, perm_indices)
                     
-                    # Compute symmetric KL divergence
-                    log_p = torch.log(p + 1e-8)  # Add small epsilon for numerical stability
-                    log_q_perm = torch.log(q_perm + 1e-8)
+                    # Compute symmetric KL divergence with numerical stability
+                    eps = 1e-8
+                    log_p = torch.log(torch.clamp(p, min=eps))  # Clamp to avoid log(0)
+                    log_q_perm = torch.log(torch.clamp(q_perm, min=eps))
                     
                     kl_pq = (p * (log_p - log_q_perm)).sum(dim=-1)
                     kl_qp = (q_perm * (log_q_perm - log_p)).sum(dim=-1)
                     sym_kl = 0.5 * (kl_pq + kl_qp)
                     
-                    cons_loss = sym_kl.mean()
+                    # Validate consistency loss
+                    if not torch.isfinite(sym_kl).all():
+                        print(f"[WARNING] Consistency loss contains NaN/Inf, skipping")
+                        cons_loss = torch.tensor(0.0, device=ce_loss.device, dtype=ce_loss.dtype)
+                    else:
+                        cons_loss = sym_kl.mean()
+                        
+                        # Additional validation
+                        if not torch.isfinite(cons_loss):
+                            print(f"[WARNING] Mean consistency loss is not finite, setting to 0")
+                            cons_loss = torch.tensor(0.0, device=ce_loss.device, dtype=ce_loss.dtype)
+                        elif cons_loss.item() < 0:
+                            print(f"[WARNING] Negative consistency loss: {cons_loss.item():.6f}")
+                        elif cons_loss.item() > 10:  # Arbitrary threshold
+                            print(f"[WARNING] Very large consistency loss: {cons_loss.item():.2f}")
         
-        self._last_cons = float(cons_loss.item())
+        self._last_cons = float(cons_loss.detach().item())
         
-        # Combine losses
-        if torch.isfinite(cons_loss):
-            loss = ce_loss + float(current_cons_weight) * cons_loss
+        # Combine losses with validation
+        if torch.isfinite(cons_loss) and current_cons_weight > 0:
+            total_loss = ce_loss + float(current_cons_weight) * cons_loss
+            
+            # Validate combined loss
+            if not torch.isfinite(total_loss):
+                print(f"[WARNING] Combined loss is not finite, using CE loss only")
+                loss = ce_loss
+                self._last_cons = 0.0
+            else:
+                loss = total_loss
         else:
             loss = ce_loss
             self._last_cons = 0.0
         
-        # Compute gradient norm
-        grad_norm = 0.0
-        if hasattr(self, 'model') and self.model is not None:
-            try:
-                total_norm = 0.0
-                for param in self.model.parameters():
-                    if param.requires_grad and param.grad is not None:
-                        param_norm = param.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                grad_norm = total_norm ** (1. / 2)
-            except (AttributeError, RuntimeError) as e:
-                # Gradient computation might not be available yet
-                pass
+        # Final loss validation
+        if not torch.isfinite(loss):
+            raise ValueError(f"Final combined loss is not finite: {loss.item()}")
         
-        self._last_grad_norm = grad_norm
-        self._last_total = float(loss.detach().cpu().item())
+        if loss.item() < 0:
+            raise ValueError(f"Negative combined loss detected: {loss.item()}")
+        
+        if loss.item() > 1000:  # Very large threshold
+            print(f"[WARNING] Extremely large combined loss: {loss.item():.2f}")
+        
+        # Gradient norm will be computed in optimizer_step after backward pass
+        # Use previously computed value or initialize to 0.0
+        if not hasattr(self, '_last_grad_norm'):
+            self._last_grad_norm = 0.0
+        # CRITICAL FIX: Don't detach loss before backward pass - this severs the gradient graph!
+        # Store loss value for logging but keep the tensor for backward pass
+        self._last_total = float(loss.detach().item())  # Only detach for logging, not for computation
         
         # Log metrics with explicit loss breakdown for debugging
         # Call our custom log method to ensure batch accuracy logging is displayed
@@ -310,6 +441,74 @@ class LMOLClassificationTrainer(Trainer):
         
         return (loss, outputs) if return_outputs else loss
     
+    # Remove custom training_step - let parent class handle backward pass
+    # The issue was that we were detaching the loss before the parent could use it
+    
+    def training_step(self, model, inputs):
+        """
+        Override training step to ensure proper gradient handling and AMP.
+        """
+        # Set up gradient diagnostics if not already done
+        self.setup_gradient_diagnostics()
+        
+        # Zero gradients with proper method
+        self.optimizer.zero_grad(set_to_none=True)
+        
+        # Compute loss
+        loss = self.compute_loss(model, inputs)
+        
+        # Backward pass with AMP scaling
+        if self.amp_scaler is not None:
+            # FP16 with scaler
+            self.amp_scaler.scale(loss).backward()
+        else:
+            # BF16 or no AMP - direct backward
+            loss.backward()
+        
+        # Compute gradient norm and apply clipping
+        if self.grad_diagnostics is not None:
+            grad_norm = self.grad_diagnostics.apply_gradient_clipping(self.model)
+        else:
+            # Fallback gradient norm computation
+            grad_norm = 0.0
+            if hasattr(self, 'model') and self.model is not None:
+                try:
+                    total_norm = 0.0
+                    param_count = 0
+                    for param in self.model.parameters():
+                        if param.requires_grad and param.grad is not None:
+                            param_norm = param.grad.norm(2)
+                            total_norm += param_norm.item() ** 2
+                            param_count += 1
+                    
+                    if param_count > 0:
+                        grad_norm = total_norm ** (1. / 2)
+                except (AttributeError, RuntimeError) as e:
+                    grad_norm = 0.0
+        
+        # Store gradient norm for logging
+        self._last_grad_norm = grad_norm
+        
+        # Apply AMP scaling and step
+        if self.amp_scaler is not None:
+            # FP16 with scaler
+            self.amp_scaler.step(self.optimizer)
+            self.amp_scaler.update()
+            
+            # Check for underflow
+            if self.grad_diagnostics is not None:
+                self.grad_diagnostics.check_amp_underflow(self.amp_scaler)
+        else:
+            # BF16 or no AMP - direct step
+            self.optimizer.step()
+        
+        # Log gradient statistics
+        if self.grad_diagnostics is not None:
+            current_step = getattr(self.state, 'global_step', 0)
+            self.grad_diagnostics.log_gradient_stats(current_step, self.model)
+        
+        return loss.detach()
+    
     def get_current_consistency_weight(self, step: int) -> float:
         """Calculate current consistency weight based on training progress."""
         if not self.use_dynamic_consistency or self.total_steps is None:
@@ -318,6 +517,12 @@ class LMOLClassificationTrainer(Trainer):
         progress = min(step / (self.total_steps * self.cons_weight_ramp_ratio), 1.0)
         current_weight = self.cons_weight_start + (self.cons_weight_end - self.cons_weight_start) * progress
         return current_weight
+    
+    def cleanup(self):
+        """Clean up resources."""
+        if self.grad_diagnostics is not None:
+            self.grad_diagnostics.cleanup()
+            self.grad_diagnostics = None
     
     def log(self, logs: Dict[str, float], step: Optional[int] = None) -> None:
         """Custom logging method for clean, minimal training output with DDP support."""
@@ -341,8 +546,16 @@ class LMOLClassificationTrainer(Trainer):
         # Reset counter for next batch
         self._accumulation_counter = 0
         
-        # Calculate effective batch number
-        effective_batch_num = step
+        # Calculate effective batch number with safeguards
+        effective_batch_num = int(step)
+        
+        # Debug: Check for suspicious step values
+        if effective_batch_num > 1000000:  # Arbitrary large threshold
+            print(f"[WARNING] Suspicious step value detected: {step} -> {effective_batch_num}")
+            print(f"[WARNING] This might indicate a logging or state corruption issue")
+            print(f"[WARNING] State info: epoch={getattr(self.state, 'epoch', 'None')}, global_step={getattr(self.state, 'global_step', 'None')}")
+            # Use a reasonable fallback - use the accumulation counter instead
+            effective_batch_num = self._accumulation_counter if hasattr(self, '_accumulation_counter') else 0
         
         # Compute averaged metrics
         avg_loss = sum(self.batch_metrics_buffer['loss']) / len(self.batch_metrics_buffer['loss']) if self.batch_metrics_buffer['loss'] else 0.0

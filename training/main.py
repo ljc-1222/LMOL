@@ -32,9 +32,10 @@ from configs.config import config
 from utils.constants import HEADER_SEPARATOR_LENGTH
 from utils import set_seed
 from utils.csv_logger import create_training_logger, CSVTrainLogger
-# No custom device utilities needed - PyTorch handles everything automatically
+from utils.gpu_diag import GPUDeviceManager, setup_gpu_environment, get_canonical_device
 from data import SCUT_FBP5500_Pairs, ClassificationCollator
 from model import model_generator
+from .cli import parse_training_args, apply_cli_overrides, print_training_banner
 # Lazy imports to avoid dependency issues
 # from .callbacks import SaveBestTrainingLossCallback
 # from .optimizer import group_parameters_for_optimizer, create_optimizer, create_scheduler
@@ -137,7 +138,7 @@ def first_batch_sanity_check(trainer):
     assert nz.numel() > 0, "no answer span"
 
 
-def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
+def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path, max_steps: Optional[int] = None):
     """
     Train LMOL model for a single fold using PyTorch's default single-process handling.
     
@@ -158,12 +159,35 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
         train_csv: Path to training CSV file
         out_dir: Output directory for this fold
     """
-    # PyTorch will automatically handle device selection
-    print(f"[INFO] Using PyTorch's default device handling (CUDA available: {torch.cuda.is_available()})")
-    if torch.cuda.is_available():
-        print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            print(f"[INFO] GPU {i}: {torch.cuda.get_device_name(i)}")
+    # Set up GPU environment and device management
+    print(f"[INFO] Setting up GPU environment...")
+    env_config = setup_gpu_environment()
+    device_manager = GPUDeviceManager(target_device=0)
+    device = device_manager.get_device()
+    
+    # Print GPU information
+    device_info = device_manager.get_device_info()
+    print(f"[INFO] Using device: {device_info['device_name']} (CUDA {device_info['compute_capability']})")
+    print(f"[INFO] Total memory: {device_info['total_memory_gb']:.2f} GB")
+    print(f"[INFO] Free memory: {device_info['free_memory_gb']:.2f} GB")
+    
+    # Set up PyTorch optimizations
+    if device.type == "cuda":
+        # Set cuDNN benchmark based on config
+        torch.backends.cudnn.benchmark = config.CUDNN_BENCHMARK
+        print(f"[INFO] cuDNN benchmark: {config.CUDNN_BENCHMARK}")
+        
+        # Set mixed precision dtype
+        if config.AMP_DTYPE == "bf16":
+            print(f"[INFO] Using bfloat16 mixed precision (A100 optimized)")
+            # Set high precision for matrix multiplications on A100
+            torch.set_float32_matmul_precision("high")
+        elif config.AMP_DTYPE == "fp16":
+            print(f"[INFO] Using float16 mixed precision")
+        else:
+            print(f"[INFO] Using full precision (no AMP)")
+    else:
+        print("[WARN] CUDA not available, falling back to CPU training")
     
     # Suppress warnings during training
     import warnings
@@ -180,15 +204,34 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     
     # Set reproducible seed for this fold (same seed across all processes)
     seed = 42 + fold_idx
-    set_seed(seed)
+    set_seed(seed, enable_numerical_stability=True)
     
     # Initialize dataset, model, and processor
     ds = SCUT_FBP5500_Pairs(str(train_csv))
     model, processor, tokenizer, fast_processor = model_generator()
     model.train()
     
-    # PyTorch will automatically handle device placement
-    print(f"[INFO] Model will be automatically placed on available device")
+    # CRITICAL: Move model to canonical device BEFORE optimizer creation
+    model = model.to(device)
+    print(f"[INFO] Model moved to device: {device}")
+    
+    # Verify model device placement
+    try:
+        device_manager.assert_all_cuda(model)
+        print(f"[INFO] Model device placement verified: all parameters on {device}")
+    except RuntimeError as e:
+        print(f"[ERROR] Model device placement failed: {e}")
+        raise
+    
+    # Apply torch.compile if enabled
+    if config.USE_TORCH_COMPILE and device.type == "cuda":
+        try:
+            print(f"[INFO] Applying torch.compile with mode: {config.TORCH_COMPILE_MODE}")
+            model = torch.compile(model, mode=config.TORCH_COMPILE_MODE)
+            print(f"[INFO] torch.compile applied successfully")
+        except Exception as e:
+            print(f"[WARN] torch.compile failed: {e}")
+            print(f"[INFO] Continuing without torch.compile")
 
     # Calculate training parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -202,6 +245,12 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     
     steps_per_epoch = math.ceil(effective_samples / effective_batch_size)
     total_steps = steps_per_epoch * config.NUM_EPOCHS
+    
+    # Override total_steps if max_steps is provided (for testing)
+    if max_steps is not None:
+        total_steps = min(total_steps, max_steps)
+        print(f"[INFO] Limited to {max_steps} steps for testing")
+    
     warmup_steps = int(math.ceil(total_steps * config.LR_WARMUP_RATIO))
     
     if trainable_params == 0:
@@ -288,7 +337,7 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
         logging_steps=config.LOGGING_STEPS,
         logging_strategy="steps",
         save_strategy="no",  # Saving handled manually (best/last)
-        fp16=config.FP16, bf16=config.BF16,  # Use config-based precision
+        fp16=(config.AMP_DTYPE == "fp16"), bf16=(config.AMP_DTYPE == "bf16"),  # Use new AMP_DTYPE config
         dataloader_num_workers=config.DATALOADER_NUM_WORKERS,
         dataloader_pin_memory=config.DATALOADER_PIN_MEMORY,
         dataloader_persistent_workers=config.DATALOADER_PERSISTENT_WORKERS,
@@ -307,8 +356,15 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
         # Flash Attention optimizations handled in model initialization
     )
 
-    # Set up dual learning rate optimizer
+    # Set up dual learning rate optimizer AFTER model is on device
     optimizer = create_optimizer(model, config.WEIGHT_DECAY)
+    
+    # Verify optimizer parameters are on correct device
+    for i, group in enumerate(optimizer.param_groups):
+        if group['params']:
+            param_device = next(iter(group['params'])).device
+            if param_device != device:
+                print(f"[WARNING] Optimizer group {i} parameters on {param_device}, expected {device}")
     
     # Configure learning rate scheduler
     scheduler = create_scheduler(optimizer, total_steps, warmup_steps, config.LR_SCHEDULE_TYPE)
@@ -353,7 +409,12 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path):
     print("-" * 72)
     
     t0 = time.time()
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        # Clean up gradient diagnostics
+        if hasattr(trainer, 'cleanup'):
+            trainer.cleanup()
     t1 = time.time()
     
     print("-" * 72)
@@ -416,11 +477,13 @@ def training_main():
     Main training function for LMOL using PyTorch's default single-process handling.
     
     Orchestrates the complete training pipeline:
-    1. Create timestamped output directory
-    2. Load and validate training CSV files
-    3. Train each fold sequentially
-    4. Clean up GPU memory between folds
-    5. Report final training summary
+    1. Parse CLI arguments and apply overrides
+    2. Set up GPU environment and device management
+    3. Create timestamped output directory
+    4. Load and validate training CSV files
+    5. Train each fold sequentially
+    6. Clean up GPU memory between folds
+    7. Report final training summary
     
     The training implements 5-fold cross-validation where each fold
     trains a separate model adapter on 4/5 of the data and evaluates
@@ -429,12 +492,42 @@ def training_main():
     Uses PyTorch's implicit single-process handling which can automatically
     utilize available GPUs if configured by the framework.
     """
-    # PyTorch will automatically handle device selection
-    print(f"[INFO] Using PyTorch's default device handling (CUDA available: {torch.cuda.is_available()})")
-    if torch.cuda.is_available():
-        print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            print(f"[INFO] GPU {i}: {torch.cuda.get_device_name(i)}")
+    # Parse CLI arguments
+    args = parse_training_args()
+    
+    # Apply CLI overrides to config
+    apply_cli_overrides(config, args)
+    
+    # Print training banner
+    print_training_banner(config, args)
+    
+    # Set up GPU environment and device management
+    print(f"[INFO] Setting up GPU environment...")
+    env_config = setup_gpu_environment()
+    device_manager = GPUDeviceManager(target_device=0)
+    device = device_manager.get_device()
+    
+    # Print GPU information
+    device_info = device_manager.get_device_info()
+    print(f"[INFO] Using device: {device_info['device_name']} (CUDA {device_info['compute_capability']})")
+    print(f"[INFO] Total memory: {device_info['total_memory_gb']:.2f} GB")
+    print(f"[INFO] Free memory: {device_info['free_memory_gb']:.2f} GB")
+    
+    # Set up PyTorch optimizations
+    if device.type == "cuda":
+        # Set cuDNN benchmark based on config
+        torch.backends.cudnn.benchmark = config.CUDNN_BENCHMARK
+        print(f"[INFO] cuDNN benchmark: {config.CUDNN_BENCHMARK}")
+        
+        # Set mixed precision dtype
+        if config.AMP_DTYPE == "bf16":
+            print(f"[INFO] Using bfloat16 mixed precision (A100 optimized)")
+        elif config.AMP_DTYPE == "fp16":
+            print(f"[INFO] Using float16 mixed precision")
+        else:
+            print(f"[INFO] Using full precision (no AMP)")
+    else:
+        print("[WARN] CUDA not available, falling back to CPU training")
     
     # Create timestamped output directory
     run_dir = resolve_path(getattr(config, "OUTPUT_DIR", "outputs")) / datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -450,7 +543,7 @@ def training_main():
         fold_dir = run_dir / f"fold{i}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         
-        train_one_fold(i, csv, fold_dir)
+        train_one_fold(i, csv, fold_dir, max_steps=args.get('max_steps'))
         
         # Clean up GPU memory between folds
         if torch.cuda.is_available():

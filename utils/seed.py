@@ -31,7 +31,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from typing import Optional
 
-def set_seed(seed: int, deterministic_cudnn: bool = False) -> None:
+def set_seed(seed: int, deterministic_cudnn: bool = False, enable_numerical_stability: bool = True) -> None:
     """
     Set random seed for reproducibility across all random number generators.
     
@@ -47,6 +47,7 @@ def set_seed(seed: int, deterministic_cudnn: bool = False) -> None:
         deterministic_cudnn: If True, sets cudnn.deterministic=True which ensures
                            reproducible convolution operations at the cost of performance.
                            Only set to True when absolute reproducibility is required.
+        enable_numerical_stability: If True, enables additional numerical stability settings
     
     Note:
         Even with these settings, some operations may still be non-deterministic:
@@ -80,6 +81,22 @@ def set_seed(seed: int, deterministic_cudnn: bool = False) -> None:
         
     # Set fork safety for reproducibility in DataLoader workers
     torch.multiprocessing.set_sharing_strategy('file_system')
+    
+    # Enable numerical stability features
+    if enable_numerical_stability:
+        # Set high precision for matrix multiplications (A100 optimized)
+        if torch.cuda.is_available():
+            torch.set_float32_matmul_precision("high")
+        
+        # Enable anomaly detection for debugging (can be disabled in production)
+        # torch.autograd.set_detect_anomaly(True)  # Uncomment for debugging
+        
+        # Set numerical stability warnings
+        import warnings
+        warnings.filterwarnings("error", category=RuntimeWarning, message=".*overflow.*")
+        warnings.filterwarnings("error", category=RuntimeWarning, message=".*invalid value.*")
+        
+        print(f"[SEED] Numerical stability features enabled for seed {seed}")
     
     # Define worker initialization function for DataLoader
     def seed_worker(worker_id: int) -> None:
@@ -130,3 +147,84 @@ def get_dataloader_kwargs(seed: int) -> dict:
         "worker_init_fn": worker_init_fn,
         "generator": g
     }
+
+
+def check_numerical_stability(model: torch.nn.Module, sample_input: torch.Tensor, 
+                            device: torch.device = None) -> dict:
+    """
+    Check numerical stability of model operations.
+    
+    Args:
+        model: PyTorch model to check
+        sample_input: Sample input tensor
+        device: Device to run checks on (default: same as sample_input)
+        
+    Returns:
+        Dictionary containing stability check results
+    """
+    if device is None:
+        device = sample_input.device
+    
+    model.eval()
+    with torch.no_grad():
+        try:
+            # Forward pass
+            output = model(sample_input)
+            
+            # Check for NaN/Inf in output
+            has_nan = torch.isnan(output).any().item() if hasattr(output, 'isnan') else False
+            has_inf = torch.isinf(output).any().item() if hasattr(output, 'isinf') else False
+            
+            # Check parameter values
+            param_stats = {}
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    param_stats[name] = {
+                        'has_nan': torch.isnan(param).any().item(),
+                        'has_inf': torch.isinf(param).any().item(),
+                        'min_val': param.min().item(),
+                        'max_val': param.max().item(),
+                        'mean_val': param.mean().item(),
+                        'std_val': param.std().item(),
+                    }
+            
+            # Count problematic parameters
+            nan_params = sum(1 for stats in param_stats.values() if stats['has_nan'])
+            inf_params = sum(1 for stats in param_stats.values() if stats['has_inf'])
+            
+            return {
+                'output_has_nan': has_nan,
+                'output_has_inf': has_inf,
+                'param_stats': param_stats,
+                'total_params': len(param_stats),
+                'nan_params': nan_params,
+                'inf_params': inf_params,
+                'is_stable': not (has_nan or has_inf or nan_params > 0 or inf_params > 0)
+            }
+            
+        except Exception as e:
+            return {
+                'error': str(e),
+                'is_stable': False
+            }
+
+
+def enable_deterministic_training(seed: int = 42) -> None:
+    """
+    Enable fully deterministic training (slower but reproducible).
+    
+    Args:
+        seed: Random seed to use
+    """
+    print(f"[DETERMINISTIC] Enabling fully deterministic training with seed {seed}")
+    
+    # Set seed with deterministic CUDA
+    set_seed(seed, deterministic_cudnn=True, enable_numerical_stability=True)
+    
+    # Additional deterministic settings
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    
+    # Set environment variables for deterministic behavior
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    
+    print(f"[DETERMINISTIC] Deterministic training enabled (may be slower)")

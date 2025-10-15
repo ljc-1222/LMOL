@@ -117,7 +117,7 @@ class Config:
     LORA_ALPHA: int = 32
     """LoRA alpha parameter (scaling factor for adaptation)"""
     
-    LORA_DROPOUT: float = 0.1
+    LORA_DROPOUT: float = 0.05
     """LoRA dropout rate for regularization"""
     
     # ============================================================================
@@ -138,13 +138,13 @@ class Config:
     # ============================================================================
     
     # Batch processing (2 pairs → 4 samples → 16 steps → 64 samples)
-    PER_DEVICE_TRAIN_BATCH_SIZE: int = 16
+    PER_DEVICE_TRAIN_BATCH_SIZE: int = 32
     """Process 2 pairs at a time (generates 4 samples with swap doubling)"""
     
-    GRADIENT_ACCUMULATION_STEPS: int = 2
+    GRADIENT_ACCUMULATION_STEPS: int = 1
     """Accumulate gradients over 16 steps before parameter update"""
     
-    DATALOADER_NUM_WORKERS: int = 48
+    DATALOADER_NUM_WORKERS: int = 16
     """Number of DataLoader worker processes for parallel data loading"""
     
     DATALOADER_PIN_MEMORY: bool = True
@@ -156,14 +156,14 @@ class Config:
     DATALOADER_DROP_LAST: bool = True
     """Drop incomplete batches for consistent batch sizes"""
     
-    DATALOADER_PREFETCH_FACTOR: int = 4
+    DATALOADER_PREFETCH_FACTOR: int = 2
     """Number of batches to prefetch per worker"""
     
     # Learning rate configuration
-    LR_LORA: float = 1e-5
+    LR_LORA: float = 2e-4
     """Learning rate for LoRA parameters (reduced for stability)"""
     
-    LR_PROJECTION: float = 1e-4
+    LR_PROJECTION: float = 2e-5
     """Learning rate for projector parameters (reduced for stability)"""
     
     WEIGHT_DECAY: float = 0.1
@@ -199,11 +199,11 @@ class Config:
     MONITOR_GRADIENT_NORMS: bool = True
     """Enable gradient norm monitoring and warnings"""
     
-    GRADIENT_NORM_THRESHOLD: float = 5.0
+    GRADIENT_NORM_THRESHOLD: float = 300.0
     """Threshold for gradient norm warnings (reduced for earlier detection)"""
     
-    GRADIENT_NORM_MIN_THRESHOLD: float = 1e-4
-    """Minimum threshold for gradient norm warnings (increased for better detection)"""
+    GRADIENT_NORM_MIN_THRESHOLD: float = 1e-12
+    """Minimum threshold for gradient norm warnings (very small to allow tiny gradients)"""
     
     # Per-class accuracy monitoring
     LOG_PER_CLASS_ACCURACY: bool = True
@@ -213,7 +213,7 @@ class Config:
     MONITOR_LOSS_ANOMALIES: bool = True
     """Enable loss anomaly detection (NaN, Inf, too small)"""
     
-    MIN_REASONABLE_LOSS: float = 1e-6
+    MIN_REASONABLE_LOSS: float = 1e-8
     """Minimum reasonable loss value (below this triggers warning)"""
     
     # ============================================================================
@@ -283,13 +283,22 @@ class Config:
     # ============================================================================
     
     USE_TORCH_COMPILE: bool = True
-    """Enable torch.compile for faster model execution"""
+    """Enable torch.compile for faster model execution (default: False for stability)"""
+    
+    TORCH_COMPILE_MODE: str = "max-autotune"
+    """torch.compile mode: 'default', 'reduce-overhead', 'max-autotune'"""
     
     USE_FLASH_ATTENTION: bool = True
     """Enable Flash Attention 2 for faster attention computation"""
     
     FLASH_ATTENTION_BACKEND: str = "sdpa"
     """Flash Attention backend: 'flash_attn', 'sdpa', or 'eager'"""
+    
+    CUDNN_BENCHMARK: bool = True
+    """Enable cuDNN benchmark for consistent input sizes (default: True for A100)"""
+    
+    GPU_LOG_INTERVAL: int = 100
+    """Log GPU memory and utilization every N steps (0 to disable)"""
     
     GRADIENT_CLIP_NORM: float = 1.0
     """Gradient clipping threshold for training stability (1.0 is a good default for most cases)"""
@@ -298,11 +307,14 @@ class Config:
     """Keep all columns to avoid processing overhead"""
     
     # Mixed precision training
+    AMP_DTYPE: str = "bf16"
+    """Mixed precision dtype: 'bf16', 'fp16', or 'none' (default: bf16 for A100)"""
+    
     FP16: bool = False
-    """Enable 16-bit floating point precision for faster training (DISABLED: can cause underflow)"""
+    """Enable 16-bit floating point precision for faster training (deprecated, use AMP_DTYPE)"""
     
     BF16: bool = True
-    """Enable bfloat16 precision (alternative to FP16) - Better numerical stability"""
+    """Enable bfloat16 precision (better for A100) (deprecated, use AMP_DTYPE)"""
     
     # Memory optimization
     GRADIENT_CHECKPOINTING: bool = True
@@ -345,6 +357,19 @@ class Config:
     
     ANSWER_SIMILAR: str = "Similar"
     """Answer string when both images are similarly attractive"""
+    
+    # ============================================================================
+    # GRADIENT DIAGNOSTICS CONFIGURATION
+    # ============================================================================
+    
+    GRAD_LOG_INTERVAL: int = 10
+    """How often to log gradient statistics (every N steps)"""
+    
+    DETECT_ANOMALY: bool = False
+    """Enable PyTorch autograd anomaly detection for debugging"""
+    
+    GRADIENT_CLIP_NORM: float = 1.0
+    """Global gradient clipping threshold (0 = disabled)"""
     
     def __post_init__(self):
         """

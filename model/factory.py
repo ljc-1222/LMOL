@@ -95,10 +95,16 @@ def model_generator():
     # MODEL LOADING WITH OPTIMIZATIONS
     # ============================================================================
     
-    # Prepare model loading arguments
+    # Prepare model loading arguments with explicit GPU device mapping
+    device_map = "auto"
+    if torch.cuda.is_available():
+        # Use "auto" for proper device mapping with quantization
+        device_map = "auto"
+        print(f"[INFO] Using device_map: {device_map} (CUDA available)")
+    
     model_kwargs = {
         "torch_dtype": torch.bfloat16,
-        "device_map": "auto",
+        "device_map": device_map,
         "quantization_config": quant_cfg,
     }
     
@@ -107,10 +113,19 @@ def model_generator():
         model_kwargs["attn_implementation"] = getattr(config, "FLASH_ATTENTION_BACKEND", "flash_attn")
     
     # Load base LLaVA model
+    print(f"[INFO] Loading model with device_map: {device_map}")
     model = LlavaForConditionalGeneration.from_pretrained(
         config.MODEL_ID,
         **model_kwargs
     )
+    
+    # Verify model device placement
+    model_device = next(model.parameters()).device
+    print(f"[INFO] Model loaded on device: {model_device}")
+    if torch.cuda.is_available() and not model_device.type == 'cuda':
+        print(f"[WARN] Model not on GPU! This may cause performance issues.")
+    elif torch.cuda.is_available():
+        print(f"[INFO] Model successfully loaded on GPU: {model_device}")
 
     # ============================================================================
     # MODEL CONFIGURATION FOR TRAINING
@@ -137,8 +152,9 @@ def model_generator():
 
     # Create LMOL projector with proper dimensions
     # CLIP ViT-L/14-336px → 1024-dim vision patches, 4096-dim LLM hidden
+    device = next(model.parameters()).device
     lmol_proj = LMOLProjector(vision_dim=1024, text_hidden_dim=4096).to(
-        next(model.parameters()).device, dtype=torch.bfloat16
+        device=device, dtype=torch.bfloat16
     )
 
     # Replace projector using the same attribute path
@@ -229,10 +245,16 @@ def build_inference_base():
             llm_int8_enable_fp32_cpu_offload=True,  # Enable CPU offload for better compatibility
         )
     
-    # Prepare model loading arguments
+    # Prepare model loading arguments with explicit GPU device mapping
+    device_map = "auto"
+    if torch.cuda.is_available():
+        # Use "auto" for proper device mapping with quantization
+        device_map = "auto"
+        print(f"[INFO] Using device_map: {device_map} (CUDA available)")
+    
     model_kwargs = {
         "torch_dtype": torch.bfloat16,
-        "device_map": "auto",
+        "device_map": device_map,
         "quantization_config": quant_cfg,
         "low_cpu_mem_usage": True,  # Reduce CPU memory usage during loading
     }
@@ -316,8 +338,9 @@ def build_inference_base():
     assert old_proj is not None, "Projector not found on the loaded LLaVA model."
     
     # Create LMOL projector with same dimensions as training
+    device = next(model.parameters()).device
     lmol_proj = LMOLProjector(vision_dim=1024, text_hidden_dim=4096).to(
-        next(model.parameters()).device, dtype=torch.bfloat16
+        device=device, dtype=torch.bfloat16
     )
     
     # Replace projector using the same attribute path
