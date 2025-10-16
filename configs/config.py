@@ -362,8 +362,8 @@ class Config:
     # GRADIENT DIAGNOSTICS CONFIGURATION
     # ============================================================================
     
-    GRAD_LOG_INTERVAL: int = 10
-    """How often to log gradient statistics (every N steps)"""
+    GRAD_LOG_INTERVAL: int = 0
+    """How often to log gradient statistics (every N steps, 0 to disable)"""
     
     DETECT_ANOMALY: bool = False
     """Enable PyTorch autograd anomaly detection for debugging"""

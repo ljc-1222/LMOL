@@ -105,6 +105,9 @@ class LMOLClassificationTrainer(Trainer):
         # Track first batch to suppress verbose model output
         self._first_batch_complete = False
         
+        # Track actual batch number for logging (independent of HuggingFace state)
+        self._actual_batch_num = 0
+        
         # Memory management configuration
         self.enable_memory_cleanup = enable_memory_cleanup
         self.memory_cleanup_frequency = memory_cleanup_frequency
@@ -146,8 +149,8 @@ class LMOLClassificationTrainer(Trainer):
         elif self.amp_dtype == 'bf16':
             print(f"[INFO] Using bf16 AMP (no scaler needed)")
         
-        # Set up gradient diagnostics
-        grad_log_interval = getattr(config, 'GRAD_LOG_INTERVAL', 10)
+        # Set up gradient diagnostics (disabled to reduce console output)
+        grad_log_interval = 0  # Disable gradient logging
         clip_grad_norm = getattr(config, 'GRADIENT_CLIP_NORM', 0.0)
         detect_anomaly = getattr(config, 'DETECT_ANOMALY', False)
         
@@ -170,7 +173,7 @@ class LMOLClassificationTrainer(Trainer):
     def setup_gradient_diagnostics(self):
         """Set up gradient diagnostics after model is available."""
         if self.grad_diagnostics is None and hasattr(self, 'model') and self.model is not None:
-            grad_log_interval = getattr(config, 'GRAD_LOG_INTERVAL', 10)
+            grad_log_interval = 0  # Disable gradient logging
             clip_grad_norm = getattr(config, 'GRADIENT_CLIP_NORM', 0.0)
             detect_anomaly = getattr(config, 'DETECT_ANOMALY', False)
             
@@ -513,10 +516,7 @@ class LMOLClassificationTrainer(Trainer):
         # Note: Optimizer step is handled by the parent HuggingFace Trainer class
         # We don't call optimizer.step() here to avoid double-stepping
         
-        # Log gradient statistics
-        if self.grad_diagnostics is not None:
-            current_step = getattr(self.state, 'global_step', 0)
-            self.grad_diagnostics.log_gradient_stats(current_step, self.model)
+        # Gradient statistics logging disabled to reduce console output
         
         
         return loss.detach()
@@ -539,9 +539,6 @@ class LMOLClassificationTrainer(Trainer):
     
     def log(self, logs: Dict[str, float], step: Optional[int] = None) -> None:
         """Custom logging method for clean, minimal training output with DDP support."""
-        if step is None:
-            step = getattr(self.state, 'global_step', 0)
-        
         # Filter out unwanted keys
         filtered_logs = {}
         for key in ['loss', 'ce_loss', 'cons_loss', 'grad_norm', 'train_acc']:
@@ -559,16 +556,9 @@ class LMOLClassificationTrainer(Trainer):
         # Reset counter for next batch
         self._accumulation_counter = 0
         
-        # Calculate effective batch number with safeguards
-        effective_batch_num = int(step)
-        
-        # Debug: Check for suspicious step values
-        if effective_batch_num > 1000000:  # Arbitrary large threshold
-            print(f"[WARNING] Suspicious step value detected: {step} -> {effective_batch_num}")
-            print(f"[WARNING] This might indicate a logging or state corruption issue")
-            print(f"[WARNING] State info: epoch={getattr(self.state, 'epoch', 'None')}, global_step={getattr(self.state, 'global_step', 'None')}")
-            # Use a reasonable fallback - use the accumulation counter instead
-            effective_batch_num = self._accumulation_counter if hasattr(self, '_accumulation_counter') else 0
+        # Increment our own batch counter (independent of HuggingFace state)
+        self._actual_batch_num += 1
+        effective_batch_num = self._actual_batch_num
         
         # Compute averaged metrics
         avg_loss = sum(self.batch_metrics_buffer['loss']) / len(self.batch_metrics_buffer['loss']) if self.batch_metrics_buffer['loss'] else 0.0
