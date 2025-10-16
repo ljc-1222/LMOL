@@ -124,7 +124,7 @@ class Config:
     # LOSS FUNCTION CONFIGURATION
     # ============================================================================
     
-    WSIM: float = 1.2
+    WSIM: float = 1.05
     """Class weight for 'Similar' class in cross-entropy loss"""
     
     CONS_WEIGHT: float = 20
@@ -160,10 +160,10 @@ class Config:
     """Number of batches to prefetch per worker"""
     
     # Learning rate configuration
-    LR_LORA: float = 2e-4
+    LR_LORA: float = 1e-3
     """Learning rate for LoRA parameters (reduced for stability)"""
     
-    LR_PROJECTION: float = 2e-5
+    LR_PROJECTION: float = 1e-4
     """Learning rate for projector parameters (reduced for stability)"""
     
     WEIGHT_DECAY: float = 0.1
@@ -248,10 +248,10 @@ class Config:
     USE_DYNAMIC_CONSISTENCY: bool = True
     """Enable dynamic consistency weight for improved training stability"""
     
-    CONS_WEIGHT_START: float = 20
+    CONS_WEIGHT_START: float = 10
     """Starting consistency weight (reduced for more conservative training)"""
     
-    CONS_WEIGHT_END: float = 5
+    CONS_WEIGHT_END: float = 4
     """Final consistency weight (reduced for more stable training)"""
     
     CONS_WEIGHT_RAMP_RATIO: float = 0.5
