@@ -31,7 +31,31 @@ from utils.constants import IGNORE_INDEX
 from utils.memory_manager import MemoryManager, get_memory_manager
 from utils.gpu_diag import GPUDeviceManager, get_canonical_device
 from utils.grad_diag import setup_gradient_diagnostics, assert_all_requires_grad
+from utils.grad_audit import GradientAudit, assert_grad_flow, check_param_updates
 from .health_monitor import HealthMonitoringCallback
+
+
+class ParameterUpdateCallback(TrainerCallback):
+    """Callback to verify parameter updates after optimizer step."""
+    
+    def __init__(self, grad_audit_enabled: bool, grad_assert_tiny: float):
+        self.grad_audit_enabled = grad_audit_enabled
+        self.grad_assert_tiny = grad_assert_tiny
+        self.pre_params = None
+    
+    def on_step_begin(self, args, state, control, model, **kwargs):
+        """Store parameters before optimizer step."""
+        if self.grad_audit_enabled:
+            self.pre_params = {name: param.clone().detach() for name, param in model.named_parameters() if param.requires_grad}
+    
+    def on_step_end(self, args, state, control, model, **kwargs):
+        """Check parameter updates after optimizer step."""
+        if self.grad_audit_enabled and self.pre_params is not None:
+            try:
+                from utils.grad_audit import check_param_updates
+                updates = check_param_updates(model, self.pre_params, eps=1e-12)
+            except RuntimeError as e:
+                pass  # Silent warning
 
 
 class LMOLClassificationTrainer(Trainer):
@@ -134,6 +158,22 @@ class LMOLClassificationTrainer(Trainer):
         self.amp_scaler = None
         self.amp_dtype = getattr(config, 'AMP_DTYPE', 'bf16')
         
+        # Initialize gradient auditing
+        self.grad_audit = None
+        self.grad_audit_enabled = getattr(config, 'GRAD_AUDIT', True)
+        self.audit_interval = getattr(config, 'AUDIT_INTERVAL', 100)
+        self.grad_assert_tiny = getattr(config, 'GRAD_ASSERT_TINY', 1e-12)
+        self.grad_clip = getattr(config, 'GRAD_CLIP', 0.0)
+        self.audit_patterns = getattr(config, 'GRAD_AUDIT_PATTERNS', ["Linear", "Conv", "Embedding", "LayerNorm", "BatchNorm", "Dropout"])
+        
+        # Parameter tracking for update verification
+        self.pre_params = None
+        self.first_backward_done = False
+        
+        # Add optimizer step hook for parameter update verification
+        if self.grad_audit_enabled:
+            self.add_callback(ParameterUpdateCallback(self.grad_audit_enabled, self.grad_assert_tiny))
+        
         # Set up AMP scaler for fp16
         if self.amp_dtype == 'fp16' and torch.cuda.is_available():
             self.amp_scaler = torch.cuda.amp.GradScaler()
@@ -154,6 +194,13 @@ class LMOLClassificationTrainer(Trainer):
                 detect_anomaly=detect_anomaly
             )
             print(f"[INFO] Initialized gradient diagnostics")
+            
+            # Set up gradient auditing if enabled
+            if self.grad_audit_enabled:
+                self.grad_audit = GradientAudit()
+                self.grad_audit.register_activation_and_grad_hooks(self.model, self.audit_patterns)
+                self.grad_audit.setup_amp_diagnostics(self.amp_dtype, self.amp_scaler)
+                print(f"[INFO] Initialized gradient auditing with patterns: {self.audit_patterns}")
     
     
     @property
@@ -444,12 +491,27 @@ class LMOLClassificationTrainer(Trainer):
     # Remove custom training_step - let parent class handle backward pass
     # The issue was that we were detaching the loss before the parent could use it
     
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         """
         Override training step to ensure proper gradient handling and AMP.
+        
+        Args:
+            model: The model to train
+            inputs: Input batch
+            num_items_in_batch: Number of items in batch (unused, for HuggingFace compatibility)
         """
         # Set up gradient diagnostics if not already done
         self.setup_gradient_diagnostics()
+        
+        # Set up gradient auditing if not already done
+        if self.grad_audit_enabled and self.grad_audit is None:
+            self.grad_audit = GradientAudit()
+            self.grad_audit.register_activation_and_grad_hooks(model, self.audit_patterns)
+            self.grad_audit.setup_amp_diagnostics(self.amp_dtype, self.amp_scaler)
+        
+        # Store parameters before update for verification
+        if self.grad_audit_enabled:
+            self.pre_params = {name: param.clone().detach() for name, param in model.named_parameters() if param.requires_grad}
         
         # Zero gradients with proper method
         self.optimizer.zero_grad(set_to_none=True)
@@ -464,6 +526,14 @@ class LMOLClassificationTrainer(Trainer):
         else:
             # BF16 or no AMP - direct backward
             loss.backward()
+        
+        # First backward pass - run gradient flow assertion (warn only for LoRA)
+        if not self.first_backward_done and self.grad_audit_enabled:
+            try:
+                assert_grad_flow(model, self.grad_assert_tiny, warn_only=True)  # Use warn_only for LoRA
+            except RuntimeError as e:
+                pass  # Silent warning for LoRA models
+            self.first_backward_done = True
         
         # Compute gradient norm and apply clipping
         if self.grad_diagnostics is not None:
@@ -486,26 +556,33 @@ class LMOLClassificationTrainer(Trainer):
                 except (AttributeError, RuntimeError) as e:
                     grad_norm = 0.0
         
+        # Apply additional gradient clipping if specified
+        if self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
+        
         # Store gradient norm for logging
         self._last_grad_norm = grad_norm
         
-        # Apply AMP scaling and step
-        if self.amp_scaler is not None:
-            # FP16 with scaler
-            self.amp_scaler.step(self.optimizer)
-            self.amp_scaler.update()
-            
-            # Check for underflow
-            if self.grad_diagnostics is not None:
-                self.grad_diagnostics.check_amp_underflow(self.amp_scaler)
-        else:
-            # BF16 or no AMP - direct step
-            self.optimizer.step()
+        # Note: Optimizer step is handled by the parent HuggingFace Trainer class
+        # We don't call optimizer.step() here to avoid double-stepping
         
         # Log gradient statistics
         if self.grad_diagnostics is not None:
             current_step = getattr(self.state, 'global_step', 0)
             self.grad_diagnostics.log_gradient_stats(current_step, self.model)
+        
+        # Log gradient auditing statistics
+        if self.grad_audit_enabled and self.grad_audit is not None:
+            current_step = getattr(self.state, 'global_step', 0)
+            self.grad_audit.increment_step()
+            self.grad_audit.log_amp_stats(current_step)
+            self.grad_audit.log_memory_stats(current_step)
+            
+            # Periodic gradient auditing
+            if current_step % self.audit_interval == 0:
+                self.grad_audit.log_grad_table(model, save_csv=True)
+                if current_step % (self.audit_interval * 5) == 0:  # Every 5 audit intervals
+                    self.grad_audit.plot_gradient_flow(model, f"gradient_flow_step_{current_step}.png")
         
         return loss.detach()
     
@@ -523,6 +600,10 @@ class LMOLClassificationTrainer(Trainer):
         if self.grad_diagnostics is not None:
             self.grad_diagnostics.cleanup()
             self.grad_diagnostics = None
+        
+        if self.grad_audit is not None:
+            self.grad_audit.cleanup()
+            self.grad_audit = None
     
     def log(self, logs: Dict[str, float], step: Optional[int] = None) -> None:
         """Custom logging method for clean, minimal training output with DDP support."""

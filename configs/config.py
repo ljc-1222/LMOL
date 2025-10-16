@@ -371,6 +371,27 @@ class Config:
     GRADIENT_CLIP_NORM: float = 1.0
     """Global gradient clipping threshold (0 = disabled)"""
     
+    # ============================================================================
+    # GRADIENT AUDITING CONFIGURATION
+    # ============================================================================
+    
+    GRAD_AUDIT: bool = True
+    """Enable comprehensive gradient auditing and monitoring"""
+    
+    AUDIT_INTERVAL: int = 100
+    """Gradient audit logging interval (every N steps)"""
+    
+    GRAD_ASSERT_TINY: float = 1e-12
+    """Minimum gradient norm threshold for assertions"""
+    
+    GRAD_CLIP: float = 0.0
+    """Gradient clipping threshold for auditing (0 = disabled)"""
+    
+    GRAD_AUDIT_PATTERNS: List[str] = field(default_factory=lambda: [
+        "Linear", "Conv", "Embedding", "LayerNorm", "BatchNorm", "Dropout"
+    ])
+    """Layer patterns to monitor for gradient auditing"""
+    
     def __post_init__(self):
         """
         Post-initialization processing.
