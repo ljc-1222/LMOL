@@ -88,15 +88,13 @@ class TrainingHealthMonitor:
         """
         self.gradient_norms.append(grad_norm)
         
-        # Check for gradient explosion
+        # Check for gradient explosion (silent)
         if grad_norm > config.GRADIENT_NORM_THRESHOLD:
-            print(f"[GRADIENT_WARNING] Gradient explosion detected: {grad_norm:.2e}")
             self.gradient_anomaly_count += 1
             return False
             
-        # Check for vanishing gradients
+        # Check for vanishing gradients (silent)
         if grad_norm < config.GRADIENT_NORM_MIN_THRESHOLD:
-            print(f"[GRADIENT_WARNING] Vanishing gradients detected: {grad_norm:.2e}")
             self.gradient_anomaly_count += 1
             return False
             
@@ -133,7 +131,7 @@ class TrainingHealthMonitor:
             return False
             
         if loss < config.MIN_REASONABLE_LOSS:
-            print(f"[LOSS_WARNING] Loss is suspiciously small: {loss:.2e}")
+            # Loss is suspiciously small (silent)
             self.loss_anomaly_count += 1
             return False
             
@@ -261,17 +259,15 @@ class HealthMonitoringCallback(TrainerCallback):
             
         self.step_count += 1
         
-        # Monitor gradient norms
+        # Monitor gradient norms (silent)
         if config.MONITOR_GRADIENT_NORMS and 'grad_norm' in logs:
             grad_norm = logs['grad_norm']
-            if not self.monitor.update_gradient_norm(grad_norm):
-                print(f"[HEALTH_WARNING] Gradient anomaly at step {self.step_count}")
+            self.monitor.update_gradient_norm(grad_norm)
         
-        # Monitor loss anomalies
+        # Monitor loss anomalies (silent)
         if config.MONITOR_LOSS_ANOMALIES and 'loss' in logs:
             loss = logs['loss']
-            if not self.monitor.check_loss_anomaly(loss):
-                print(f"[HEALTH_WARNING] Loss anomaly at step {self.step_count}")
+            self.monitor.check_loss_anomaly(loss)
         
         # Monitor per-class accuracy
         if config.LOG_PER_CLASS_ACCURACY:

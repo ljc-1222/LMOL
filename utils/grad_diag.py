@@ -234,15 +234,18 @@ class GradientDiagnostics:
         
         # Check for gradient health issues
         if zero_grad_count > total_params * 0.5:
-            print(f"[WARNING] {zero_grad_count}/{total_params} parameters have zero gradients!")
+            # Many parameters have zero gradients (silent)
+            pass
         
         if nan_inf_count > 0:
             print(f"[ERROR] {nan_inf_count}/{total_params} parameters have NaN/Inf gradients!")
         
         if global_norm > 100.0:
-            print(f"[WARNING] Very large global gradient norm: {global_norm:.2e}")
+            # Very large global gradient norm (silent)
+            pass
         elif global_norm < 1e-8:
-            print(f"[WARNING] Very small global gradient norm: {global_norm:.2e}")
+            # Very small global gradient norm (silent)
+            pass
     
     def enable_anomaly_detection(self) -> None:
         """Enable PyTorch autograd anomaly detection."""

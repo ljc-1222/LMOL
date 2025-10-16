@@ -45,56 +45,12 @@ LMOL/
 │   ├── scoring.py (Bradley-Terry scoring)
 │   ├── io.py (I/O utilities)
 │   ├── memory_manager.py (memory management)
-│   ├── grad_audit.py (gradient auditing utilities)
 │   └── constrained_generation.py (constrained generation utilities)
 └── scripts/
     ├── train.py (training entry point)
     ├── evaluate.py (evaluation entry point)
     └── generate_data.py (data generation entry point)
 ```
-
-## Gradient Auditing System
-
-The LMOL project includes a comprehensive gradient auditing system (`utils/grad_audit.py`) designed to detect and fix gradient vanishing, exploding, and other training issues. This system provides:
-
-### Features
-
-- **Real-time Gradient Monitoring**: Tracks gradient norms and statistics across all model layers
-- **Activation Analysis**: Monitors activation patterns and saturation ratios for ReLU, Sigmoid, and Tanh layers
-- **Parameter Update Verification**: Ensures parameters are actually being updated during training
-- **AMP Diagnostics**: Monitors Automatic Mixed Precision scaling and overflow detection
-- **Memory Tracking**: Logs GPU memory usage and allocation patterns
-- **Visualization**: Generates gradient flow plots and detailed CSV reports
-
-### Usage
-
-The gradient auditing system is automatically enabled during training. You can control it using CLI flags:
-
-```bash
-# Enable gradient auditing (default: true)
-python scripts/train.py --grad_audit true
-
-# Set audit interval (default: 100 steps)
-python scripts/train.py --audit_interval 50
-
-# Configure gradient clipping (default: 0 = disabled)
-python scripts/train.py --grad_clip 1.0
-
-# Set gradient assertion threshold (default: 1e-12)
-python scripts/train.py --grad_assert_tiny 1e-10
-```
-
-### Output Files
-
-The system generates several diagnostic files during training:
-
-- `grad_table_step_X.csv`: Detailed gradient statistics for each parameter
-- `gradient_flow_step_X.png`: Visual representation of gradient flow across layers
-- Training logs with gradient health monitoring
-
-### LoRA Compatibility
-
-The system is designed to work seamlessly with LoRA fine-tuning, where many parameters may legitimately have zero gradients. The auditing system accounts for this by using warning-only mode for gradient flow assertions.
 
 ## Environment & Dependencies
 

@@ -127,7 +127,7 @@ class Config:
     WSIM: float = 1.2
     """Class weight for 'Similar' class in cross-entropy loss"""
     
-    CONS_WEIGHT: float = 20.0
+    CONS_WEIGHT: float = 20
     """Base consistency weight for swap consistency regularization"""
     
     SWAP_CE_WEIGHT: float = 1.0
@@ -248,10 +248,10 @@ class Config:
     USE_DYNAMIC_CONSISTENCY: bool = True
     """Enable dynamic consistency weight for improved training stability"""
     
-    CONS_WEIGHT_START: float = 5.0
+    CONS_WEIGHT_START: float = 20
     """Starting consistency weight (reduced for more conservative training)"""
     
-    CONS_WEIGHT_END: float = 20.0
+    CONS_WEIGHT_END: float = 5
     """Final consistency weight (reduced for more stable training)"""
     
     CONS_WEIGHT_RAMP_RATIO: float = 0.5
@@ -371,27 +371,9 @@ class Config:
     GRADIENT_CLIP_NORM: float = 1.0
     """Global gradient clipping threshold (0 = disabled)"""
     
-    # ============================================================================
-    # GRADIENT AUDITING CONFIGURATION
-    # ============================================================================
-    
-    GRAD_AUDIT: bool = True
-    """Enable comprehensive gradient auditing and monitoring"""
-    
-    AUDIT_INTERVAL: int = 100
-    """Gradient audit logging interval (every N steps)"""
-    
-    GRAD_ASSERT_TINY: float = 1e-12
-    """Minimum gradient norm threshold for assertions"""
-    
     GRAD_CLIP: float = 0.0
-    """Gradient clipping threshold for auditing (0 = disabled)"""
-    
-    GRAD_AUDIT_PATTERNS: List[str] = field(default_factory=lambda: [
-        "Linear", "Conv", "Embedding", "LayerNorm", "BatchNorm", "Dropout"
-    ])
-    """Layer patterns to monitor for gradient auditing"""
-    
+    """Gradient clipping threshold (0 = disabled)"""
+
     def __post_init__(self):
         """
         Post-initialization processing.

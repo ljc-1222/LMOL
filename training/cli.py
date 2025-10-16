@@ -72,28 +72,9 @@ def parse_training_args() -> Dict[str, Any]:
         help="Enable PyTorch autograd anomaly detection"
     )
     
-    # Gradient Auditing Arguments
-    grad_audit_group = parser.add_argument_group("Gradient Auditing")
-    grad_audit_group.add_argument(
-        "--grad_audit",
-        type=str,
-        choices=["true", "false"],
-        default="true",
-        help="Enable comprehensive gradient auditing"
-    )
-    grad_audit_group.add_argument(
-        "--audit_interval",
-        type=int,
-        default=100,
-        help="Gradient audit logging interval (every N steps)"
-    )
-    grad_audit_group.add_argument(
-        "--grad_assert_tiny",
-        type=float,
-        default=1e-12,
-        help="Minimum gradient norm threshold for assertions"
-    )
-    grad_audit_group.add_argument(
+    # Gradient Clipping Arguments
+    grad_clip_group = parser.add_argument_group("Gradient Clipping")
+    grad_clip_group.add_argument(
         "--grad_clip",
         type=float,
         default=0.0,
@@ -174,7 +155,6 @@ def parse_training_args() -> Dict[str, Any]:
     # Convert string booleans to actual booleans
     args_dict["cudnn_benchmark"] = args_dict["cudnn_benchmark"] == "true"
     args_dict["compile"] = args_dict["compile"] == "true"
-    args_dict["grad_audit"] = args_dict["grad_audit"] == "true"
     
     return args_dict
 
@@ -209,18 +189,9 @@ def apply_cli_overrides(config, args: Dict[str, Any]) -> None:
     if args.get("detect_anomaly") is not None:
         config.DETECT_ANOMALY = args["detect_anomaly"]
     
-    # Gradient auditing overrides
-    if args.get("grad_audit") is not None:
-        config.GRAD_AUDIT = args["grad_audit"]
-    
-    if args.get("audit_interval") is not None:
-        config.AUDIT_INTERVAL = args["audit_interval"]
-    
-    if args.get("grad_assert_tiny") is not None:
-        config.GRAD_ASSERT_TINY = args["grad_assert_tiny"]
-    
-    if args.get("grad_clip") is not None:
-        config.GRAD_CLIP = args["grad_clip"]
+        # Gradient clipping overrides
+        if args.get("grad_clip") is not None:
+            config.GRAD_CLIP = args["grad_clip"]
     
     # Training overrides
     if args.get("batch_size"):

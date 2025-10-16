@@ -18,6 +18,7 @@ import json
 import math
 import os
 import time
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
@@ -25,8 +26,19 @@ from typing import List, Dict, Any, Optional, Union
 import torch
 from transformers import TrainingArguments
 
+# Suppress verbose logging from various libraries
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("peft").setLevel(logging.ERROR)
+logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
+logging.getLogger("torch").setLevel(logging.ERROR)
+
 # Fix HuggingFace tokenizers parallelism warning when using multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Suppress verbose output from various libraries
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
 
 from configs.config import config
 from utils.constants import HEADER_SEPARATOR_LENGTH
@@ -264,9 +276,6 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path, max_steps: Opt
         group_params = sum(p.numel() for p in group['params'])
         print(f"    {group_name}: {group_params:,} parameters, Learning Rate (LR) = {group['lr']:.4e}")
     
-    # Count trainable layers
-    trainable_layers = sum(1 for p in model.parameters() if p.requires_grad)
-    print(f"  Trainable layers: {trainable_layers}\n")
     
     # Analyze class distribution in training data
     print(f"Class Distribution Analysis:")

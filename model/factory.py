@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Tuple
 import os
 import torch
+import logging
 from transformers import (
     AutoTokenizer,
     AutoProcessor,
@@ -24,12 +25,21 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
+# Suppress verbose logging from transformers and other libraries
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("peft").setLevel(logging.ERROR)
+logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
+
 # Fix HuggingFace tokenizers parallelism warning when using multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Allow BitsAndBytes to use CPU offloading without strict validation
 # This is needed when GPU memory is limited and some modules need to be on CPU/disk
 os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
+
+# Suppress HuggingFace verbose output during model loading
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 from configs.config import config
 from .architecture import _find_projector_handle, _set_all_requires_grad, _report_model_sizes, _breakdown_projector
@@ -178,7 +188,16 @@ def model_generator():
         task_type="CAUSAL_LM",
         modules_to_save=None,  # Projector is part of base model; no 2nd copy
     )
-    model = get_peft_model(model, lora_cfg)
+    
+    # Suppress PEFT model summary output
+    import sys
+    import io
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        model = get_peft_model(model, lora_cfg)
+    finally:
+        sys.stdout = old_stdout
 
     # ============================================================================
     # PARAMETER CONFIGURATION
