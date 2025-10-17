@@ -151,13 +151,11 @@ def load_single_fold(fold_path: Path, model_type: str = "best") -> Tuple[PeftMod
         print(f"  - BOS token: {tok.bos_token} (ID: {tok.bos_token_id})")
     
     # Validate answer tokenization (with leading space to match collator)
-    print(f"[Validate] Answer token sequences (with leading space):")
+    print(f"[Validate] Answer token sequences (exact case only):")
     for answer in [config.ANSWER_FIRST, config.ANSWER_SECOND, config.ANSWER_SIMILAR]:
         # CRITICAL: Add leading space to match collator tokenization
-        toks_cap = tok(' ' + answer, add_special_tokens=False).input_ids
-        toks_lower = tok(' ' + answer.lower(), add_special_tokens=False).input_ids
-        print(f"  - ' {answer}': {toks_cap}")
-        print(f"  - ' {answer.lower()}': {toks_lower}")
+        toks = tok(' ' + answer, add_special_tokens=False).input_ids
+        print(f"  - ' {answer}': {toks}")
     
     print(f"[Validate] ✓ Tokenizer validation complete")
     # ===== END VALIDATION BLOCK =====
@@ -318,14 +316,14 @@ def _make_label_token_seqs(tokenizer) -> dict:
     """
     Build token sequences for each canonical answer.
     
-    This function creates token sequences for both capitalized and lowercase versions
-    of each answer to support flexible matching during evaluation.
+    This function creates token sequences for exact case-sensitive answers only:
+    "First", "Second", and "Similar" (no lowercase variants).
     
     IMPORTANT: The collator constructs sequences as: prompt + ' ' + answer
     So we must tokenize answers WITH a leading space to match training labels.
     
     Returns:
-        Dictionary mapping answer labels to list of token sequence variants
+        Dictionary mapping answer labels to token sequence
         Example: {"First": [[29871, 3824]], ...} where 29871 is space token
     """
     seqs = {}
@@ -333,17 +331,13 @@ def _make_label_token_seqs(tokenizer) -> dict:
         # CRITICAL: Add leading space to match collator tokenization
         # The collator constructs: prompt + ' ' + answer_text
         # Without the space, tokenization is different and matching will fail
-        variants = [' ' + label, ' ' + label.lower()]  # Both " First" and " first"
-        token_variants = []
-        for variant in variants:
-            try:
-                # Tokenize answer without special tokens
-                toks = tokenizer(variant, add_special_tokens=False).input_ids
-            except Exception:
-                toks = tokenizer.encode(variant, add_special_tokens=False)
-            if toks not in token_variants:  # Avoid duplicates
-                token_variants.append(toks)
-        seqs[label] = token_variants
+        variant = ' ' + label  # Only exact case: " First", " Second", " Similar"
+        try:
+            # Tokenize answer without special tokens
+            toks = tokenizer(variant, add_special_tokens=False).input_ids
+        except Exception:
+            toks = tokenizer.encode(variant, add_special_tokens=False)
+        seqs[label] = [toks]  # Single token sequence per label
     return seqs
 
 
@@ -441,7 +435,14 @@ def evaluate_fold(fold_name: str, model, processor, eval_csv: Path, fold_path: P
             prog.set_postfix(acc=f"{correct/(idx+1):.4f}")
     acc = correct / total if total else 0.0
     dur = time.perf_counter() - start_ts
+    
+    # Calculate per-class accuracies
+    from .metrics import calculate_per_class_accuracy
+    class_accuracies = calculate_per_class_accuracy(y_true, y_pred)
+    
+    # Print detailed results
     print(f"[Result] {fold_name}: accuracy={acc:.6f} ({correct}/{total}) | time={dur/60:.2f} min")
+    print(f"[Class Acc] First={class_accuracies[config.ANSWER_FIRST]:.3f}, Second={class_accuracies[config.ANSWER_SECOND]:.3f}, Similar={class_accuracies[config.ANSWER_SIMILAR]:.3f}")
     print(f"[Cache] images={len(image_cache)} pixel_tensors={len(pixel_cache)}")
 
     return correct, total, y_true, y_pred

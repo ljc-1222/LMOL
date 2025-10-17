@@ -407,7 +407,6 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path, max_steps: Opt
     
     # Add callback for automatic model saving and CSV logging
     best_dir = out_dir / "best"
-    last_dir = out_dir / "last"
     trainer.add_callback(SaveBestTrainingLossCallback(best_dir, processor, tokenizer, csv_logger))
 
     # Perform sanity check on first batch
@@ -428,21 +427,7 @@ def train_one_fold(fold_idx: int, train_csv: Path, out_dir: Path, max_steps: Opt
     
     print("-" * 72)
 
-    # Save final model and metadata
-    last_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        trainer.save_model(str(last_dir))
-    except (OSError, RuntimeError) as e:
-        print(f"[WARN] Failed to save model via trainer.save_model: {e}")
-        torch.save(model.state_dict(), last_dir / "pytorch_model.bin")
-    
-    try:
-        model.save_pretrained(last_dir)
-        tokenizer.save_pretrained(last_dir)
-        processor.save_pretrained(last_dir)
-        print(f"[INFO] Final model saved to {last_dir}")
-    except (OSError, RuntimeError, AttributeError) as e:
-        print(f"[WARN] Failed to save final model: {e}")
+    # Final model saving is now handled by the callback as last_{epoch}
     
     # Report best model saved by callback
     best_meta_path = best_dir / "best_meta.json"

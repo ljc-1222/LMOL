@@ -160,10 +160,10 @@ class Config:
     """Number of batches to prefetch per worker"""
     
     # Learning rate configuration
-    LR_LORA: float = 1e-3
+    LR_LORA: float = 5e-5
     """Learning rate for LoRA parameters (reduced for stability)"""
     
-    LR_PROJECTION: float = 1e-4
+    LR_PROJECTION: float = 5e-6
     """Learning rate for projector parameters (reduced for stability)"""
     
     WEIGHT_DECAY: float = 0.1
@@ -199,7 +199,7 @@ class Config:
     MONITOR_GRADIENT_NORMS: bool = True
     """Enable gradient norm monitoring and warnings"""
     
-    GRADIENT_NORM_THRESHOLD: float = 300.0
+    GRADIENT_NORM_THRESHOLD: float = 30
     """Threshold for gradient norm warnings (reduced for earlier detection)"""
     
     GRADIENT_NORM_MIN_THRESHOLD: float = 1e-12
@@ -213,7 +213,7 @@ class Config:
     MONITOR_LOSS_ANOMALIES: bool = True
     """Enable loss anomaly detection (NaN, Inf, too small)"""
     
-    MIN_REASONABLE_LOSS: float = 1e-8
+    MIN_REASONABLE_LOSS: float = 1e-3
     """Minimum reasonable loss value (below this triggers warning)"""
     
     # ============================================================================
@@ -248,10 +248,10 @@ class Config:
     USE_DYNAMIC_CONSISTENCY: bool = True
     """Enable dynamic consistency weight for improved training stability"""
     
-    CONS_WEIGHT_START: float = 10
+    CONS_WEIGHT_START: float = 5
     """Starting consistency weight (reduced for more conservative training)"""
     
-    CONS_WEIGHT_END: float = 4
+    CONS_WEIGHT_END: float = 2
     """Final consistency weight (reduced for more stable training)"""
     
     CONS_WEIGHT_RAMP_RATIO: float = 0.5
@@ -300,7 +300,7 @@ class Config:
     GPU_LOG_INTERVAL: int = 100
     """Log GPU memory and utilization every N steps (0 to disable)"""
     
-    GRADIENT_CLIP_NORM: float = 1.0
+    GRADIENT_CLIP_NORM: float = 0.5
     """Gradient clipping threshold for training stability (1.0 is a good default for most cases)"""
     
     REMOVE_UNUSED_COLUMNS: bool = False

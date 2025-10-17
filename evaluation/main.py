@@ -131,19 +131,26 @@ def evaluation_main():
             # Ensure the model folder exists
             model_folder.mkdir(parents=True, exist_ok=True)
             
-            out_cm = model_folder / "confusion_matrix.png"
+            # Use consistent naming: confusion_matrix_{model_type}_{fold_name}.png
+            out_cm = model_folder / f"confusion_matrix_{args.model_type}_{fold_path.name}.png"
             plot_and_save_cm(y_true, y_pred, out_cm, title=f"{fold_path.name} ({args.model_type}) Confusion Matrix")
             print(f"[Plot] Saved confusion matrix to {out_cm}")
         except Exception as e:
             print(f"[Warn] Failed to plot/save confusion matrix for {fold_path.name}: {e}")
     
     if grand_total:
-        print(f"[Overall] accuracy={grand_correct/grand_total:.6f} ({grand_correct}/{grand_total})")
+        overall_acc = grand_correct/grand_total
+        print(f"[Overall] accuracy={overall_acc:.6f} ({grand_correct}/{grand_total})")
+        
+        # Calculate and display overall per-class accuracies
+        from .metrics import calculate_per_class_accuracy
+        overall_class_acc = calculate_per_class_accuracy(grand_y_true, grand_y_pred)
+        print(f"[Overall Class Acc] First={overall_class_acc[config.ANSWER_FIRST]:.3f}, Second={overall_class_acc[config.ANSWER_SECOND]:.3f}, Similar={overall_class_acc[config.ANSWER_SIMILAR]:.3f}")
     
     # 繪製並儲存整體 confusion matrix（儲存在 run_dir）
     try:
-        overall_cm_path = run_dir / "confusion_overall.png"
-        plot_and_save_cm(grand_y_true, grand_y_pred, overall_cm_path, title="Overall Confusion Matrix")
+        overall_cm_path = run_dir / f"confusion_matrix_overall_{args.model_type}.png"
+        plot_and_save_cm(grand_y_true, grand_y_pred, overall_cm_path, title=f"Overall Confusion Matrix ({args.model_type})")
         print(f"[Plot] Saved overall confusion matrix to {overall_cm_path}")
     except Exception as e:
         print(f"[Warn] Failed to plot/save overall confusion matrix: {e}")

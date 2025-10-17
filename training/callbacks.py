@@ -51,7 +51,7 @@ class SaveBestTrainingLossCallback(TrainerCallback):
             csv_logger: Optional CSV logger for training metrics
         """
         self.best_dir = best_dir
-        self.last_dir = best_dir.parent / "last"
+        self.fold_dir = best_dir.parent  # Parent directory of best_dir (the fold directory)
         self.best_loss = float("inf")
         self.last_saved_epoch = -1
         self._processor = processor
@@ -75,6 +75,30 @@ class SaveBestTrainingLossCallback(TrainerCallback):
                 print(f"[Notify] {title}: {message}")
         except Exception:
             print(f"[Notify] {title}: {message}")
+
+    def _is_valid_loss(self, loss: float) -> bool:
+        """
+        Validate that a loss value is reasonable for model saving.
+        
+        Args:
+            loss: Loss value to validate
+            
+        Returns:
+            True if loss is valid for saving, False otherwise
+        """
+        # Check for invalid loss values
+        if loss <= 0.0:
+            return False
+        
+        # Check for unreasonably small loss (likely numerical error)
+        if loss < 1e-6:
+            return False
+            
+        # Check for NaN or infinite values
+        if not (0 < loss < float('inf')):
+            return False
+            
+        return True
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         """
@@ -103,6 +127,11 @@ class SaveBestTrainingLossCallback(TrainerCallback):
         is_main = getattr(args, "local_rank", -1) in (-1, 0)
         
         if not is_main:
+            return
+        
+        # Validate loss value - prevent saving models with invalid loss
+        if not self._is_valid_loss(loss):
+            print(f"[WARNING] Skipping model save due to invalid loss: {loss}")
             return
         
         # Calculate batch time for performance monitoring
@@ -208,7 +237,11 @@ class SaveBestTrainingLossCallback(TrainerCallback):
             except Exception:
                 pass
         
-        # Save metadata
+        # Save metadata - validate loss before saving
+        if not self._is_valid_loss(self.best_loss):
+            print(f"[ERROR] Attempted to save best model with invalid loss: {self.best_loss}")
+            return
+            
         metadata = {
             "best_loss": round(self.best_loss, 6),
             "global_step": state.global_step,
@@ -229,28 +262,39 @@ class SaveBestTrainingLossCallback(TrainerCallback):
 
     def _save_last(self, model, state):
         """
-        Save the last model for checkpointing.
+        Save the last model for checkpointing as last_{epoch}.
         
         Args:
             model: Model to save
             state: Training state
         """
-        self.last_dir.mkdir(parents=True, exist_ok=True)
+        # Get current epoch as integer
+        current_epoch = int(state.epoch) if state.epoch is not None else 0
+        last_dir = self.fold_dir / f"last_{current_epoch}"
+        
+        last_dir.mkdir(parents=True, exist_ok=True)
         try:
-            model.save_pretrained(str(self.last_dir), safe_serialization=False)
+            model.save_pretrained(str(last_dir), safe_serialization=False)
         except Exception:
-            torch.save(model.state_dict(), self.last_dir / "pytorch_model.bin")
+            torch.save(model.state_dict(), last_dir / "pytorch_model.bin")
         
         # Save processor and tokenizer
         for obj in (self._processor, self._tokenizer):
             try:
-                obj.save_pretrained(self.last_dir)
+                obj.save_pretrained(last_dir)
             except Exception:
                 pass
         
-        # Save metadata
-        (self.last_dir / "last_meta.json").write_text(json.dumps({
-            "loss": round(float(state.log_history[-1].get("loss", 0)), 6),
+        # Get loss from log history and validate
+        last_loss = float(state.log_history[-1].get("loss", 0)) if state.log_history else 0.0
+        
+        # Save metadata - validate loss before saving
+        if not self._is_valid_loss(last_loss):
+            print(f"[ERROR] Attempted to save last model with invalid loss: {last_loss}")
+            return
+            
+        (last_dir / "last_meta.json").write_text(json.dumps({
+            "loss": round(last_loss, 6),
             "global_step": state.global_step,
             "epoch": state.epoch,
             "saved_at": datetime.now().isoformat(timespec="seconds"),

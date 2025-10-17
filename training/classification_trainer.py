@@ -96,7 +96,10 @@ class LMOLClassificationTrainer(Trainer):
             'ce_loss': [],
             'cons_loss': [],
             'grad_norm': [],
-            'train_acc': []
+            'train_acc': [],
+            'class_acc_first': [],
+            'class_acc_second': [],
+            'class_acc_similar': []
         }
         
         # Track accumulation steps to know when to log
@@ -364,6 +367,11 @@ class LMOLClassificationTrainer(Trainer):
                         pairs_aligned = False
                         break
                 
+                # Debug: Print pair alignment status occasionally
+                if not hasattr(self, '_pair_debug_printed') and not pairs_aligned:
+                    print(f"[DEBUG] Pairs not aligned: pair_ids = {pair_ids.tolist()}")
+                    self._pair_debug_printed = True
+                
                 if pairs_aligned:
                     # Get probabilities
                     probs = torch.softmax(classification_logits, dim=-1)  # [N, 3]
@@ -384,6 +392,13 @@ class LMOLClassificationTrainer(Trainer):
                     kl_pq = (p * (log_p - log_q_perm)).sum(dim=-1)
                     kl_qp = (q_perm * (log_q_perm - log_p)).sum(dim=-1)
                     sym_kl = 0.5 * (kl_pq + kl_qp)
+                    
+                    # Debug: Print consistency loss details occasionally
+                    if not hasattr(self, '_cons_debug_printed'):
+                        print(f"[DEBUG] Consistency calculation: p.shape={p.shape}, q.shape={q.shape}")
+                        print(f"[DEBUG] p[0]={p[0].tolist()}, q[0]={q[0].tolist()}, q_perm[0]={q_perm[0].tolist()}")
+                        print(f"[DEBUG] sym_kl={sym_kl.tolist()}")
+                        self._cons_debug_printed = True
                     
                     # Validate consistency loss
                     if not torch.isfinite(sym_kl).all():
@@ -448,6 +463,9 @@ class LMOLClassificationTrainer(Trainer):
             "cons_loss": weighted_cons_loss,  # Show weighted consistency loss, not raw
             "grad_norm": self._last_grad_norm,
             "train_acc": self._last_train_acc,
+            "class_acc_first": self._last_class_acc.get('first', 0.0),
+            "class_acc_second": self._last_class_acc.get('second', 0.0),
+            "class_acc_similar": self._last_class_acc.get('similar', 0.0),
         }
         
         self.log(log_dict)
@@ -541,7 +559,7 @@ class LMOLClassificationTrainer(Trainer):
         """Custom logging method for clean, minimal training output with DDP support."""
         # Filter out unwanted keys
         filtered_logs = {}
-        for key in ['loss', 'ce_loss', 'cons_loss', 'grad_norm', 'train_acc']:
+        for key in ['loss', 'ce_loss', 'cons_loss', 'grad_norm', 'train_acc', 'class_acc_first', 'class_acc_second', 'class_acc_similar']:
             if key in logs:
                 filtered_logs[key] = logs[key]
                 self.batch_metrics_buffer[key].append(logs[key])
@@ -560,12 +578,22 @@ class LMOLClassificationTrainer(Trainer):
         self._actual_batch_num += 1
         effective_batch_num = self._actual_batch_num
         
-        # Compute averaged metrics
-        avg_loss = sum(self.batch_metrics_buffer['loss']) / len(self.batch_metrics_buffer['loss']) if self.batch_metrics_buffer['loss'] else 0.0
+        # Compute averaged metrics - prevent empty buffer issues
+        if not self.batch_metrics_buffer['loss']:
+            print(f"[WARNING] Empty loss buffer detected at step {effective_batch_num}, skipping logging")
+            return
+            
+        avg_loss = sum(self.batch_metrics_buffer['loss']) / len(self.batch_metrics_buffer['loss'])
         avg_ce_loss = sum(self.batch_metrics_buffer['ce_loss']) / len(self.batch_metrics_buffer['ce_loss']) if self.batch_metrics_buffer['ce_loss'] else 0.0
         avg_cons_loss = sum(self.batch_metrics_buffer['cons_loss']) / len(self.batch_metrics_buffer['cons_loss']) if self.batch_metrics_buffer['cons_loss'] else 0.0
         avg_grad_norm = self.batch_metrics_buffer['grad_norm'][-1] if self.batch_metrics_buffer['grad_norm'] else 0.0
-        train_acc = self.batch_metrics_buffer['train_acc'][-1] if self.batch_metrics_buffer.get('train_acc') else 0.0
+        # FIXED: Average accuracy across all gradient accumulation steps, not just take the last one
+        train_acc = sum(self.batch_metrics_buffer['train_acc']) / len(self.batch_metrics_buffer['train_acc']) if self.batch_metrics_buffer.get('train_acc') else 0.0
+        
+        # FIXED: Average class accuracies across all gradient accumulation steps
+        class_acc_first = sum(self.batch_metrics_buffer['class_acc_first']) / len(self.batch_metrics_buffer['class_acc_first']) if self.batch_metrics_buffer.get('class_acc_first') else 0.0
+        class_acc_second = sum(self.batch_metrics_buffer['class_acc_second']) / len(self.batch_metrics_buffer['class_acc_second']) if self.batch_metrics_buffer.get('class_acc_second') else 0.0
+        class_acc_similar = sum(self.batch_metrics_buffer['class_acc_similar']) / len(self.batch_metrics_buffer['class_acc_similar']) if self.batch_metrics_buffer.get('class_acc_similar') else 0.0
         
         # Clear buffers for next batch
         for key in self.batch_metrics_buffer:
@@ -599,10 +627,8 @@ class LMOLClassificationTrainer(Trainer):
         
         # Enhanced logging with per-class accuracy
         if True:  # Always print in single-process mode
-            if hasattr(self, '_last_class_acc') and self._last_class_acc:
-                class_acc_str = f" | Class Acc: F={self._last_class_acc.get('first', 0.0):.3f}, S={self._last_class_acc.get('second', 0.0):.3f}, Sim={self._last_class_acc.get('similar', 0.0):.3f}"
-            else:
-                class_acc_str = ""
+            # Use averaged class accuracies instead of last step only
+            class_acc_str = f" | Class Acc: F={class_acc_first:.3f}, S={class_acc_second:.3f}, Sim={class_acc_similar:.3f}"
             
             print(f"Batch {effective_batch_num:4d} | Epoch {epoch_progress:.5f} | "
                   f"Loss: {avg_loss:.3e} (CE: {avg_ce_loss:.3e}, WCons: {avg_cons_loss:.3e}) | "
@@ -620,9 +646,9 @@ class LMOLClassificationTrainer(Trainer):
             'lr_projection': lr_proj,
             'lr_lora': lr_lora,
             'train_acc': train_acc,
-            'train_acc_first': self._last_class_acc.get('first', 0.0) if hasattr(self, '_last_class_acc') else 0.0,
-            'train_acc_second': self._last_class_acc.get('second', 0.0) if hasattr(self, '_last_class_acc') else 0.0,
-            'train_acc_similar': self._last_class_acc.get('similar', 0.0) if hasattr(self, '_last_class_acc') else 0.0,
+            'train_acc_first': class_acc_first,
+            'train_acc_second': class_acc_second,
+            'train_acc_similar': class_acc_similar,
             'step': effective_batch_num,
         }
         
